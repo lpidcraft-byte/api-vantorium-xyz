@@ -98,13 +98,13 @@ def normalize(text):
 
 DATASET = load_dataset()
 
-# --- 3. MOTOR ---
+# --- 3. MOTOR & ARAMA ---
 def analyze_query(query):
     q = query.lower()
     return {
         'is_greeting': bool(re.search(r'\b(merhaba|selam|hello|hi|hey|günaydın|nasılsın|naber|nbr)\b', q)),
         'is_math': bool(re.match(r'^[\d\s\+\-\*\/\(\)\.\,\^%]+$', query) and re.search(r'[\+\-\*\/\^%]', query)),
-        'is_code': bool(re.search(r'\b(kod|function|class|php|javascript|python|api|hata|error|debug)\b', q)),
+        'is_code': bool(re.search(r'\b(kod|function|class|php|javascript|python|api|hata|error|debug|yazılım|programlama)\b', q)),
     }
 
 def web_search(query, parts):
@@ -115,30 +115,63 @@ def web_search(query, parts):
     ]
     headers = {
         'User-Agent': random.choice(user_agents),
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept': 'application/json, text/html, application/xhtml+xml, */*',
         'Accept-Language': 'tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7',
     }
     session = requests.Session()
     session.headers.update(headers)
+
+    # 1. GOOGLE PROGRAMMABLE SEARCH (CSE)
     try:
-        ddg_url = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}"
-        r = session.get(ddg_url, timeout=10)
-        matches = re.findall(r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>', r.text, re.IGNORECASE | re.DOTALL)
-        for url, title in matches[:3]:
-            if 'uddg=' in url:
-                parsed = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
-                url = parsed.get('uddg', [url])[0]
-            results.append({'title': re.sub('<[^>]+>', '', title), 'url': url, 'source': 'duckduckgo'})
-    except: pass
-    
+        cse_url = f"https://cse.google.com/cse/element/v1?rsz=filtered_cse&num=3&hl=tr&source=gcsc&cselibv=8a5d5b6de8c9f12f&cx=f79f63e39ec7f4c78&q={urllib.parse.quote(query)}&safe=off&cse_tok=&exp=csqr,cc&callback=cb"
+        r = session.get(cse_url, timeout=10)
+        match = re.search(r'cb\((.*)\)', r.text, re.DOTALL)
+        if match:
+            g_data = json.loads(match.group(1))
+            if 'results' in g_data:
+                for item in g_data['results'][:3]:
+                    results.append({
+                        'title': item.get('titleNoFormatting', ''),
+                        'url': item.get('unescapedUrl', ''),
+                        'snippet': item.get('contentNoFormatting', ''),
+                        'source': 'google'
+                    })
+    except Exception as e:
+        pass
+
+    # 2. WIKIPEDIA API
+    try:
+        wiki_url = f"https://tr.wikipedia.org/w/api.php?action=query&list=search&srsearch={urllib.parse.quote(query)}&utf8=&format=json&srlimit=2"
+        r = session.get(wiki_url, timeout=10)
+        w_data = r.json()
+        if 'query' in w_data and 'search' in w_data['query']:
+            for item in w_data['query']['search']:
+                clean_snippet = re.sub(r'<[^>]+>', '', item.get('snippet', ''))
+                results.append({
+                    'title': item.get('title', ''),
+                    'url': f"https://tr.wikipedia.org/wiki/{urllib.parse.quote(item.get('title', '').replace(' ', '_'))}",
+                    'snippet': clean_snippet,
+                    'source': 'wikipedia'
+                })
+    except Exception as e:
+        pass
+
+    # 3. GITHUB (Kod/Teknik sorularda)
     if parts['is_code']:
         try:
-            gh_url = f"https://api.github.com/search/repositories?q={requests.utils.quote(query)}&sort=stars&per_page=2"
+            gh_url = f"https://api.github.com/search/repositories?q={urllib.parse.quote(query)}&sort=stars&per_page=2"
             r = session.get(gh_url, timeout=10)
             if r.status_code == 200:
                 for item in r.json().get('items', []):
-                    results.append({'title': item.get('full_name', ''), 'url': item.get('html_url', ''), 'snippet': item.get('description', '') or '', 'source': 'github'})
-        except: pass
+                    results.append({
+                        'title': item.get('full_name', ''),
+                        'url': item.get('html_url', ''),
+                        'snippet': item.get('description', '') or 'Açıklama yok.',
+                        'source': 'github'
+                    })
+        except Exception as e:
+            pass
+            
     return results
 
 def synthesize_results(query, results):
@@ -149,13 +182,15 @@ def synthesize_results(query, results):
         if r['url'] in seen: continue
         seen.add(r['url'])
         snippet = r.get('snippet', '')
-        if len(snippet) > 150: snippet = snippet[:147] + "..."
+        if len(snippet) > 200: snippet = snippet[:197] + "..."
         line = f"• [{r['source'].upper()}] {r['title']}"
-        if snippet: line += f" - {snippet}"
+        if snippet: line += f"\n{snippet}"
         line += f"\n{r['url']}"
         lines.append(line)
-        if len(lines) >= 3: break
-    return f"'{query}' hakkında bulduklarım:\n\n" + "\n\n".join(lines)
+        if len(lines) >= 4: break 
+    
+    header = f"'{query}' hakkında Google, Wikipedia ve diğer kaynaklardan bulduklarım:\n"
+    return header + "\n\n".join(lines)
 
 def get_answer(kelime):
     normalized = normalize(kelime)
@@ -170,6 +205,7 @@ def get_answer(kelime):
         return random.choice(DATASET[normalized]), "veri_seti"
     cached = memory_get(normalized)
     if cached: return cached, "hafiza"
+    
     results = web_search(kelime, parts)
     if results:
         ans = synthesize_results(kelime, results)
@@ -194,75 +230,102 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated
 
-# --- 5. HTML & CSS (Inter, Modern Tasarım) ---
+# --- 5. HTML & CSS (Gelişmiş Inter Tasarımı) ---
 BASE_STYLE = """
 <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0a0a0a; color: #ededed; min-height: 100vh; -webkit-font-smoothing: antialiased; }
-    a { color: #10a37f; text-decoration: none; transition: color 0.2s; }
-    a:hover { color: #1ddba5; text-decoration: none; }
-    .navbar { padding: 16px 40px; border-bottom: 1px solid #1f1f1f; display: flex; justify-content: space-between; align-items: center; position: sticky; top: 0; background: rgba(10,10,10,0.8); backdrop-filter: blur(10px); z-index: 100; }
-    .navbar h1 { font-size: 18px; font-weight: 700; color: #fff; letter-spacing: -0.5px; }
-    .navbar .logo { display: flex; align-items: center; gap: 8px; color: #fff; font-weight: 700; font-size: 18px; }
-    .logo-icon { width: 24px; height: 24px; background: #10a37f; border-radius: 6px; display: flex; align-items: center; justify-content: center; font-size: 14px; color: #000; font-weight: 800; }
-    .container { max-width: 440px; margin: 80px auto; padding: 40px; background: #0f0f0f; border: 1px solid #1f1f1f; border-radius: 16px; box-shadow: 0 10px 40px rgba(0,0,0,0.5); }
-    .container.wide { max-width: 900px; }
-    h2 { font-size: 26px; font-weight: 600; margin-bottom: 8px; color: #fff; letter-spacing: -0.5px; }
-    .subtitle { color: #888; font-size: 14px; margin-bottom: 32px; line-height: 1.5; }
-    label { display: block; font-size: 13px; font-weight: 500; color: #ccc; margin-bottom: 8px; }
-    input[type=text], input[type=password] { width: 100%; padding: 12px 16px; background: #0a0a0a; border: 1px solid #2a2a2a; border-radius: 8px; color: #fff; font-size: 14px; font-family: inherit; margin-bottom: 20px; outline: none; transition: border 0.2s; }
-    input:focus { border-color: #10a37f; box-shadow: 0 0 0 3px rgba(16,163,127,0.1); }
-    button { width: 100%; padding: 12px; background: #10a37f; color: #fff; border: none; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer; font-family: inherit; transition: background 0.2s; }
-    button:hover { background: #0d8c6c; }
-    button.danger { background: #dc2626; }
-    button.danger:hover { background: #b91c1c; }
-    .link-row { text-align: center; margin-top: 24px; font-size: 14px; color: #888; }
-    .error { background: #2a0f0f; color: #f87171; padding: 12px; border-radius: 8px; margin-bottom: 20px; font-size: 14px; border: 1px solid #4a1a1a; }
-    .card { background: #0f0f0f; border: 1px solid #1f1f1f; border-radius: 12px; padding: 28px; margin-bottom: 24px; }
-    .card h3 { font-size: 16px; font-weight: 600; margin-bottom: 16px; color: #fff; }
-    .card p { color: #a1a1a1; font-size: 14px; line-height: 1.7; margin-bottom: 12px; }
-    .api-key-box { background: #000; border: 1px solid #2a2a2a; padding: 16px; border-radius: 8px; font-family: 'SF Mono', Monaco, Consolas, monospace; font-size: 13px; word-break: break-all; color: #10a37f; margin-bottom: 16px; }
-    .code-block { background: #000; border: 1px solid #2a2a2a; padding: 16px; border-radius: 8px; font-family: 'SF Mono', Monaco, Consolas, monospace; font-size: 13px; color: #ededed; overflow-x: auto; margin: 12px 0; line-height: 1.6; }
-    .nav-actions { display: flex; gap: 10px; align-items: center; }
-    .btn-small { padding: 8px 16px; font-size: 13px; background: #1a1a1a; color: #fff; border: 1px solid #2a2a2a; border-radius: 6px; cursor: pointer; width: auto; text-decoration: none; display: inline-block; font-weight: 500; transition: all 0.2s; }
-    .btn-small:hover { background: #2a2a2a; color: #fff; text-decoration: none; }
-    ul { list-style: none; padding-left: 0; }
-    ul li { padding: 12px 0; color: #a1a1a1; font-size: 14px; border-bottom: 1px solid #1a1a1a; display: flex; align-items: flex-start; gap: 10px; line-height: 1.6; }
-    ul li:last-child { border-bottom: none; }
-    ul li::before { content: "•"; color: #10a37f; font-weight: bold; }
-    h1.page-title { font-size: 32px; margin-bottom: 8px; color: #fff; font-weight: 700; letter-spacing: -0.8px; }
-    h2.section-title { font-size: 18px; margin-top: 40px; margin-bottom: 16px; color: #fff; font-weight: 600; padding-bottom: 8px; border-bottom: 1px solid #1f1f1f; }
-    .footer { text-align: center; padding: 40px 20px; color: #555; font-size: 13px; border-top: 1px solid #1f1f1f; margin-top: 60px; }
+    body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #09090b; color: #ededed; min-height: 100vh; -webkit-font-smoothing: antialiased; display: flex; flex-direction: column; }
+    a { color: #10a37f; text-decoration: none; transition: color 0.15s ease; }
+    a:hover { color: #34d399; text-decoration: none; }
     
-    /* Chat Ekranı */
-    .chat-layout { display: flex; flex-direction: column; height: calc(100vh - 65px); max-width: 900px; margin: 0 auto; width: 100%; padding: 0 20px; }
-    .chat-history { flex: 1; overflow-y: auto; padding: 30px 0; display: flex; flex-direction: column; gap: 24px; }
+    /* Navbar */
+    .navbar { padding: 0 24px; height: 64px; border-bottom: 1px solid #1f1f1f; display: flex; justify-content: space-between; align-items: center; position: sticky; top: 0; background: rgba(9, 9, 11, 0.85); backdrop-filter: blur(12px); z-index: 100; }
+    .logo { display: flex; align-items: center; gap: 10px; color: #fff; font-weight: 700; font-size: 18px; letter-spacing: -0.5px; }
+    .logo-icon { width: 28px; height: 28px; background: linear-gradient(135deg, #10a37f, #0d8c6c); border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 15px; color: #fff; font-weight: 800; }
+    .nav-actions { display: flex; gap: 12px; align-items: center; }
+    .btn-nav { padding: 8px 16px; font-size: 14px; color: #a1a1a1; background: transparent; border: none; border-radius: 6px; cursor: pointer; text-decoration: none; font-weight: 500; transition: all 0.15s ease; }
+    .btn-nav:hover { color: #fff; background: #1f1f1f; }
+    .btn-nav.primary { background: #10a37f; color: #fff; }
+    .btn-nav.primary:hover { background: #0d8c6c; }
+
+    /* Auth Forms */
+    .auth-wrapper { flex: 1; display: flex; align-items: center; justify-content: center; padding: 24px; }
+    .container { width: 100%; max-width: 400px; padding: 40px; background: #111113; border: 1px solid #1f1f1f; border-radius: 16px; box-shadow: 0 8px 32px rgba(0,0,0,0.4); }
+    .container.wide { max-width: 900px; margin: 40px auto; }
+    
+    h2 { font-size: 24px; font-weight: 600; margin-bottom: 6px; color: #fff; letter-spacing: -0.5px; }
+    .subtitle { color: #888; font-size: 14px; margin-bottom: 28px; line-height: 1.5; }
+    
+    label { display: block; font-size: 13px; font-weight: 500; color: #ccc; margin-bottom: 6px; }
+    input[type=text], input[type=password] { width: 100%; padding: 12px 14px; background: #09090b; border: 1px solid #27272a; border-radius: 8px; color: #fff; font-size: 14px; font-family: inherit; margin-bottom: 20px; outline: none; transition: border 0.15s ease, box-shadow 0.15s ease; }
+    input:focus { border-color: #10a37f; box-shadow: 0 0 0 3px rgba(16,163,127,0.15); }
+    
+    .btn { width: 100%; padding: 12px; background: #10a37f; color: #fff; border: none; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer; font-family: inherit; transition: background 0.15s ease; display: flex; justify-content: center; align-items: center; gap: 8px; }
+    .btn:hover { background: #0d8c6c; }
+    .btn.danger { background: #ef4444; }
+    .btn.danger:hover { background: #dc2626; }
+    .btn.secondary { background: #27272a; color: #fff; }
+    .btn.secondary:hover { background: #3f3f46; }
+    .btn-small { width: auto; padding: 8px 16px; font-size: 13px; }
+
+    .link-row { text-align: center; margin-top: 24px; font-size: 14px; color: #888; }
+    .error { background: rgba(239, 68, 68, 0.1); color: #f87171; padding: 12px; border-radius: 8px; margin-bottom: 20px; font-size: 14px; border: 1px solid rgba(239, 68, 68, 0.2); }
+
+    /* Cards & Info */
+    .card { background: #111113; border: 1px solid #1f1f1f; border-radius: 12px; padding: 28px; margin-bottom: 20px; }
+    .card h3 { font-size: 16px; font-weight: 600; margin-bottom: 16px; color: #fff; display: flex; align-items: center; gap: 8px; }
+    .card p { color: #a1a1a1; font-size: 14px; line-height: 1.7; margin-bottom: 12px; }
+    .card ul { list-style: none; padding-left: 0; }
+    .card ul li { padding: 10px 0; color: #a1a1a1; font-size: 14px; border-bottom: 1px solid #1f1f1f; display: flex; gap: 10px; line-height: 1.6; }
+    .card ul li:last-child { border-bottom: none; }
+    .card ul li::before { content: "•"; color: #10a37f; font-weight: bold; }
+
+    .api-key-box { background: #09090b; border: 1px solid #27272a; padding: 16px; border-radius: 8px; font-family: 'SF Mono', Monaco, Consolas, monospace; font-size: 14px; word-break: break-all; color: #10a37f; margin-bottom: 16px; display: flex; justify-content: space-between; align-items: center; }
+    .code-block { background: #09090b; border: 1px solid #27272a; padding: 16px; border-radius: 8px; font-family: 'SF Mono', Monaco, Consolas, monospace; font-size: 13px; color: #ededed; overflow-x: auto; margin: 12px 0; line-height: 1.6; }
+    
+    h1.page-title { font-size: 28px; margin-bottom: 8px; color: #fff; font-weight: 600; letter-spacing: -0.5px; }
+    h2.section-title { font-size: 18px; margin-top: 40px; margin-bottom: 16px; color: #fff; font-weight: 600; padding-bottom: 8px; border-bottom: 1px solid #1f1f1f; }
+    .footer { text-align: center; padding: 40px 20px; color: #555; font-size: 13px; border-top: 1px solid #1f1f1f; margin-top: auto; }
+
+    /* Chat UI */
+    .chat-layout { display: flex; flex-direction: column; flex: 1; max-width: 900px; margin: 0 auto; width: 100%; padding: 0 20px; height: calc(100vh - 64px); }
+    .chat-history { flex: 1; overflow-y: auto; padding: 30px 0; display: flex; flex-direction: column; gap: 24px; scrollbar-width: thin; scrollbar-color: #27272a transparent; }
+    .chat-history::-webkit-scrollbar { width: 6px; }
+    .chat-history::-webkit-scrollbar-thumb { background-color: #27272a; border-radius: 10px; }
+    
     .chat-msg { display: flex; gap: 16px; width: 100%; max-width: 800px; margin: 0 auto; }
-    .chat-msg.user { justify-content: flex-end; }
-    .chat-msg.user .msg-bubble { background: #1a1a1a; border-radius: 16px 16px 4px 16px; padding: 14px 20px; max-width: 80%; }
-    .chat-msg.ai .msg-bubble { background: transparent; padding: 14px 0; max-width: 100%; }
-    .chat-msg .avatar { width: 32px; height: 32px; border-radius: 6px; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 13px; flex-shrink: 0; }
-    .chat-msg.user .avatar { background: #10a37f; color: #fff; order: 2; }
-    .chat-msg.ai .avatar { background: #19c37d; color: #fff; }
-    .msg-content { color: #ededed; font-size: 15px; line-height: 1.7; white-space: pre-wrap; }
-    .chat-input-area { padding: 20px 0 30px; position: sticky; bottom: 0; background: #0a0a0a; }
+    .chat-msg.user { flex-direction: row-reverse; }
+    .chat-msg .avatar { width: 32px; height: 32px; border-radius: 6px; display: flex; align-items: center; justify-content: center; font-weight: 600; font-size: 13px; flex-shrink: 0; }
+    .chat-msg.user .avatar { background: #27272a; color: #fff; }
+    .chat-msg.ai .avatar { background: #10a37f; color: #fff; }
+    .msg-content { color: #ededed; font-size: 15px; line-height: 1.7; white-space: pre-wrap; padding-top: 4px; }
+    .chat-msg.user .msg-content { background: #1f1f1f; padding: 12px 18px; border-radius: 18px; border-top-right-radius: 4px; }
+    
+    .chat-input-area { padding: 20px 0 30px; background: #09090b; }
     .chat-input-box { position: relative; max-width: 800px; margin: 0 auto; }
-    .chat-input-box input { width: 100%; padding: 16px 60px 16px 20px; background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 12px; color: #fff; font-size: 15px; outline: none; font-family: inherit; margin: 0; transition: border 0.2s; }
-    .chat-input-box input:focus { border-color: #10a37f; }
-    .chat-input-box button { position: absolute; right: 8px; top: 50%; transform: translateY(-50%); width: 40px; height: 40px; border-radius: 8px; padding: 0; display: flex; align-items: center; justify-content: center; background: #10a37f; }
+    .chat-input-box input { width: 100%; padding: 16px 56px 16px 20px; background: #111113; border: 1px solid #27272a; border-radius: 12px; color: #fff; font-size: 15px; outline: none; font-family: inherit; margin: 0; transition: border 0.15s ease, box-shadow 0.15s ease; box-shadow: 0 4px 20px rgba(0,0,0,0.2); }
+    .chat-input-box input:focus { border-color: #10a37f; box-shadow: 0 0 0 3px rgba(16,163,127,0.15); }
+    .chat-input-box button { position: absolute; right: 8px; top: 50%; transform: translateY(-50%); width: 36px; height: 36px; border-radius: 8px; padding: 0; display: flex; align-items: center; justify-content: center; background: #10a37f; border: none; cursor: pointer; color: #fff; transition: background 0.15s ease; }
     .chat-input-box button:hover { background: #0d8c6c; }
 </style>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 """
 
 def render_page(title, content, user=None, show_nav=True):
     nav = ""
     if show_nav:
+        if user:
+            actions = '<a href="/chat" class="btn-nav">Sohbet</a><a href="/dashboard" class="btn-nav">Dashboard</a><a href="/info" class="btn-nav">Kurallar</a><a href="/logout" class="btn-nav">Çıkış</a>'
+        else:
+            actions = '<a href="/info" class="btn-nav">Kurallar</a><a href="/login" class="btn-nav">Giriş</a><a href="/register" class="btn-nav primary">Kayıt Ol</a>'
+
         nav = f"""
         <div class="navbar">
             <a href="/" class="logo"><div class="logo-icon">V</div>Vantorium</a>
             <div class="nav-actions">
-                {'<a href="/chat" class="btn-small">Sohbet</a><a href="/dashboard" class="btn-small">Dashboard</a><a href="/info" class="btn-small">Kurallar</a><a href="/logout" class="btn-small">Çıkış</a>' if user else '<a href="/login" class="btn-small">Giriş</a><a href="/register" class="btn-small">Kayıt</a>'}
+                {actions}
             </div>
         </div>
         """
@@ -276,6 +339,8 @@ def index():
 
 @app.route('/register', methods=['GET', 'POST'])
 def register():
+    if get_current_user(): return redirect('/dashboard')
+    
     error = None
     if request.method == 'POST':
         username = request.form.get('username', '').strip()
@@ -296,24 +361,28 @@ def register():
             conn.close()
     
     content = f"""
-    <div class="container">
-        <h2>Hesap Oluştur</h2>
-        <p class="subtitle">Vantorium'a katılarak kendi API anahtarını oluştur.</p>
-        {f'<div class="error">{error}</div>' if error else ''}
-        <form method="POST">
-            <label>Kullanıcı Adı</label>
-            <input type="text" name="username" required autocomplete="username" placeholder="kullanici_adi">
-            <label>Şifre</label>
-            <input type="password" name="password" required autocomplete="new-password" placeholder="••••••••">
-            <button type="submit">Kayıt Ol</button>
-        </form>
-        <div class="link-row">Hesabın var mı? <a href="/login">Giriş Yap</a></div>
+    <div class="auth-wrapper">
+        <div class="container">
+            <h2>Hesap Oluştur</h2>
+            <p class="subtitle">Vantorium'a katılarak kendi API anahtarını oluştur.</p>
+            {f'<div class="error">{error}</div>' if error else ''}
+            <form method="POST">
+                <label>Kullanıcı Adı</label>
+                <input type="text" name="username" required autocomplete="username" placeholder="kullanici_adi">
+                <label>Şifre</label>
+                <input type="password" name="password" required autocomplete="new-password" placeholder="••••••••">
+                <button type="submit" class="btn">Kayıt Ol</button>
+            </form>
+            <div class="link-row">Hesabın var mı? <a href="/login">Giriş Yap</a></div>
+        </div>
     </div>
     """
     return render_page("Kayıt", content)
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
+    if get_current_user(): return redirect('/dashboard')
+    
     error = None
     if request.method == 'POST':
         username = request.form.get('username', '').strip()
@@ -333,18 +402,20 @@ def login():
         conn.close()
     
     content = f"""
-    <div class="container">
-        <h2>Tekrar Hoş Geldin</h2>
-        <p class="subtitle">Hesabına giriş yaparak dashboard'a eriş.</p>
-        {f'<div class="error">{error}</div>' if error else ''}
-        <form method="POST">
-            <label>Kullanıcı Adı</label>
-            <input type="text" name="username" required autocomplete="username" placeholder="kullanici_adi">
-            <label>Şifre</label>
-            <input type="password" name="password" required autocomplete="current-password" placeholder="••••••••">
-            <button type="submit">Giriş Yap</button>
-        </form>
-        <div class="link-row">Hesabın yok mu? <a href="/register">Kayıt Ol</a></div>
+    <div class="auth-wrapper">
+        <div class="container">
+            <h2>Tekrar Hoş Geldin</h2>
+            <p class="subtitle">Hesabına giriş yaparak dashboard'a eriş.</p>
+            {f'<div class="error">{error}</div>' if error else ''}
+            <form method="POST">
+                <label>Kullanıcı Adı</label>
+                <input type="text" name="username" required autocomplete="username" placeholder="kullanici_adi">
+                <label>Şifre</label>
+                <input type="password" name="password" required autocomplete="current-password" placeholder="••••••••">
+                <button type="submit" class="btn">Giriş Yap</button>
+            </form>
+            <div class="link-row">Hesabın yok mu? <a href="/register">Kayıt Ol</a></div>
+        </div>
     </div>
     """
     return render_page("Giriş", content)
@@ -369,24 +440,26 @@ def dashboard():
     example_url = f"{base_url}/api-key={user['api_key']}?word=merhaba"
     
     content = f"""
-    <div class="container wide" style="margin-top:40px;">
+    <div class="container wide">
         <h1 class="page-title">Dashboard</h1>
         <p class="subtitle" style="font-size:15px;">Hoş geldin, <strong style="color:#fff;">{user['username']}</strong>. API anahtarını aşağıdan yönetebilirsin.</p>
         
         <div class="card">
             <h3>API Anahtarın</h3>
-            <div class="api-key-box">{user['api_key']}</div>
+            <div class="api-key-box">
+                {user['api_key']}
+            </div>
             <p style="color:#888;font-size:13px;">Bu anahtarı kimseyle paylaşma. Güvenliğin için düzenli olarak yenileyebilirsin.</p>
             <form method="POST" action="/regenerate-key" style="margin-top:16px;">
-                <button type="submit" class="danger" style="width:auto;padding:8px 16px;font-size:13px;">Anahtarı Yenile</button>
+                <button type="submit" class="btn danger btn-small">Anahtarı Yenile</button>
             </form>
         </div>
 
         <div class="card">
             <h3>Kullanım Örneği</h3>
-            <p style="margin-bottom:8px;">Aşağıdaki adrese HTTP GET isteği atarak API'yi kullanabilirsin:</p>
+            <p>Aşağıdaki adrese HTTP GET isteği atarak API'yi kullanabilirsin:</p>
             <div class="code-block">{example_url}</div>
-            <p style="color:#888;font-size:13px;">Yanıt JSON formatında döner. <code style="color:#10a37f;">"answer"</code> alanı asistanın cevabıdır.</p>
+            <p style="color:#888;font-size:13px;margin-bottom:0;">Yanıt JSON formatında döner. <code style="color:#10a37f;">"answer"</code> alanı asistanın cevabıdır.</p>
         </div>
     </div>
     """
@@ -401,14 +474,14 @@ def chat():
         <div class="chat-history" id="chatHistory">
             <div class="chat-msg ai">
                 <div class="avatar">V</div>
-                <div class="msg-content">Merhaba! Ben Vantorium. Geçmiş sohbetlerini hatırlarım, bilmediğim şeyleri internetten araştırırım. Ne sormak istersin?</div>
+                <div class="msg-content">Merhaba! Ben Vantorium. Geçmiş sohbetlerini hatırlarım, bilmediğim şeyleri Google, Wikipedia ve GitHub üzerinden araştırırım. Ne sormak istersin?</div>
             </div>
         </div>
         <div class="chat-input-area">
             <div class="chat-input-box">
-                <input type="text" id="chatInput" placeholder="Bir mesaj yaz..." autocomplete="off">
+                <input type="text" id="chatInput" placeholder="Vantorium'a bir şey sor..." autocomplete="off">
                 <button onclick="sendChat()" id="sendBtn">
-                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="color:#fff;"><line x1="12" y1="19" x2="12" y2="5"></line><polyline points="5 12 12 5 19 12"></polyline></svg>
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"></line><polyline points="5 12 12 5 19 12"></polyline></svg>
                 </button>
             </div>
         </div>
@@ -418,6 +491,7 @@ def chat():
         const chatInput = document.getElementById('chatInput');
         
         chatInput.addEventListener('keypress', e => { if (e.key === 'Enter') sendChat(); });
+        chatInput.focus();
 
         function addMsg(text, sender) {
             const div = document.createElement('div');
@@ -485,13 +559,13 @@ def info():
     user = get_current_user()
     base_url = request.host_url.rstrip('/')
     content = f"""
-    <div class="container wide" style="margin-top:40px;">
+    <div class="container wide">
         <h1 class="page-title">Bilgi Merkezi</h1>
         <p class="subtitle" style="font-size:15px;">Vantorium API'sini kullanmadan önce bilmen gereken her şey.</p>
         
         <div class="card">
             <h3>Vantorium Nedir?</h3>
-            <p>Vantorium, doğal dildeki sorulara anlamlı ve hızlı yanıt üretebilen bir yapay zekâ asistanıdır. Kendi bilgi tabanı ve gerçek zamanlı internet araştırması ile çalışır. Amacı, kullanıcılarına en doğru ve güncel cevapları sunmaktır.</p>
+            <p>Vantorium, doğal dildeki sorulara anlamlı ve hızlı yanıt üretebilen bir yapay zekâ asistanıdır. Kendi bilgi tabanı, Google, Wikipedia ve GitHub gibi devasa kaynaklardan gelen verilerle çalışır. Amacı, kullanıcılarına en doğru ve güncel cevapları sunmaktır.</p>
         </div>
 
         <h2 class="section-title">API Anahtarı Kullanımı</h2>
@@ -542,7 +616,7 @@ def info():
     """
     return render_page("Bilgi", content, user)
 
-# --- 7. API (Key Doğrulamalı) ---
+# --- 7. DIŞ API (Key Doğrulamalı) ---
 @app.route('/api-key=<apikey>', methods=['GET'])
 def api_word(apikey):
     word = request.args.get('word')
@@ -564,7 +638,7 @@ def api_word(apikey):
         'meta': {
             'source': source,
             'time_ms': round((time.time() - start) * 1000, 2),
-            'engine': 'Vantorium v4.0',
+            'engine': 'Vantorium v4.1',
             'timestamp': datetime.now().astimezone().isoformat()
         }
     })
