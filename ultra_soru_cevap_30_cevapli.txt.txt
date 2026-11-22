@@ -4,6 +4,28 @@ Toplam benzersiz Input: 256
 Toplam Reply: 7680
 
 ================================================================================
+Input: selamlar
+Reply: Selam! Hoş geldin.
+Reply: Merhaba, nasıl yardımcı olabilirim?
+Reply: Selam, buradayım.
+Reply: Merhaba! Ne hakkında konuşmak istersin?
+Reply: Selam! Seni dinliyorum.
+Reply: Hoş geldin, sohbet edebiliriz.
+Reply: Merhaba! Bugün ne konuşalım?
+Reply: Selam, hazırım.
+Reply: Merhaba! Nasıl gidiyor?
+Reply: Selam! Bir konu seçebilirsin.
+Reply: Selam! Hoş geldin. İstersen devam edebiliriz.
+Reply: Merhaba, nasıl yardımcı olabilirim? İstersen devam edebiliriz.
+Reply: Selam, buradayım. İstersen devam edebiliriz.
+Reply: Merhaba! Ne hakkında konuşmak istersin? İstersen devam edebiliriz.
+Reply: Selam! Seni dinliyorum. İstersen devam edebiliriz.
+Reply: Hoş geldin, sohbet edebiliriz. İstersen devam edebiliriz.
+
+Input: merhabalar
+Reply: Merhabalar, nasıl yardımcı olabilirim?
+Reply: Merhaba!, size nasıl yardımcı olabilirim?, söylerseniz yardımcı olabilirim
+Reply: Merhaba Reis!, nasılsın, nasıl yardımcı olabilirim?
 
 Input: selam
 Reply: Selam! Hoş geldin.
