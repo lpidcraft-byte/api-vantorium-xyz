@@ -8,36 +8,30 @@ import urllib.parse
 import time
 import secrets
 import hashlib
-import html
 import ast
-import operator as op
-
+import operator
 from datetime import datetime
 from functools import wraps
 from flask import (
-    Flask, request, jsonify, Response,
-    render_template_string, redirect,
+    Flask,
+    request,
+    jsonify,
+    Response,
+    redirect,
     make_response
 )
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
 
+DB_FILE = "vantorium.db"
+
 # =========================================================
 # 1. DATABASE
 # =========================================================
 
-DB_FILE = "vantorium.db"
-
-
-def db():
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
 def init_db():
-    conn = db()
+    conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
 
     c.execute("""
@@ -75,9 +69,11 @@ def init_db():
 init_db()
 
 
-# =========================================================
-# 2. HELPERS
-# =========================================================
+def db():
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
 
 def hash_password(password):
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
@@ -92,12 +88,10 @@ def normalize(text):
 
 def memory_get(word):
     conn = db()
-
     row = conn.execute(
         "SELECT answer FROM memory WHERE word = ?",
         (word,)
     ).fetchone()
-
     conn.close()
 
     return row["answer"] if row else None
@@ -123,11 +117,10 @@ def memory_save(word, answer, confidence, source):
 
 
 # =========================================================
-# 3. DATASET
+# 2. DATASET
 # =========================================================
 
 def load_dataset():
-
     files = [
         "ultra_soru_cevap_30_cevapli.txt",
         "ultra_soru_cevap_30_cevapli.txt.txt",
@@ -138,41 +131,37 @@ def load_dataset():
     data = {}
 
     for filename in files:
-
         if not os.path.exists(filename):
             continue
 
-        with open(
-            filename,
-            "r",
-            encoding="utf-8"
-        ) as file:
+        try:
+            with open(filename, "r", encoding="utf-8") as file:
+                current_question = None
 
-            current_q = None
+                for line in file:
+                    line = line.strip()
 
-            for line in file:
+                    if not line or line.startswith("#"):
+                        continue
 
-                line = line.strip()
+                    if line.startswith("Input:"):
+                        current_question = normalize(
+                            line.replace("Input:", "", 1).strip()
+                        )
 
-                if not line or line.startswith("#"):
-                    continue
+                        if current_question not in data:
+                            data[current_question] = []
 
-                if line.startswith("Input:"):
+                    elif line.startswith("Reply:") and current_question:
+                        answer = line.replace("Reply:", "", 1).strip()
 
-                    current_q = normalize(
-                        line.replace("Input:", "").strip()
-                    )
+                        if answer:
+                            data[current_question].append(answer)
 
-                    if current_q not in data:
-                        data[current_q] = []
+            break
 
-                elif line.startswith("Reply:") and current_q:
-
-                    data[current_q].append(
-                        line.replace("Reply:", "").strip()
-                    )
-
-        break
+        except Exception:
+            continue
 
     return data
 
@@ -181,373 +170,456 @@ DATASET = load_dataset()
 
 
 # =========================================================
-# 4. QUERY ANALYSIS
+# 3. QUERY ANALYSIS
 # =========================================================
 
 def analyze_query(query):
+    q = normalize(query)
 
-    q = query.lower()
+    code_words = [
+        "kod",
+        "python",
+        "javascript",
+        "js",
+        "node",
+        "php",
+        "flask",
+        "html",
+        "css",
+        "api",
+        "github",
+        "programlama",
+        "yazılım",
+        "function",
+        "class",
+        "bug",
+        "hata",
+        "error",
+        "debug",
+        "sql",
+        "database",
+        "veritabanı",
+        "react",
+        "discord bot",
+        "telegram bot"
+    ]
+
+    greeting_words = [
+        "merhaba",
+        "selam",
+        "hello",
+        "hi",
+        "hey",
+        "günaydın",
+        "iyi akşamlar",
+        "iyi geceler",
+        "nasılsın",
+        "naber",
+        "nbr"
+    ]
+
+    is_math = bool(
+        re.fullmatch(
+            r"[0-9\s\+\-\*\/\(\)\.\,\^%]+",
+            query
+        )
+        and re.search(r"[\+\-\*\/\^%]", query)
+    )
 
     return {
-        "is_greeting": bool(
-            re.search(
-                r"\b(merhaba|selam|hello|hi|hey|günaydın|nasılsın|naber|nbr)\b",
-                q
-            )
+        "is_greeting": any(
+            re.search(r"\b" + re.escape(word) + r"\b", q)
+            for word in greeting_words
         ),
-
-        "is_math": bool(
-            re.match(
-                r"^[\d\s\+\-\*\/\(\)\.\,\^%]+$",
-                query
-            )
-            and
-            re.search(r"[\+\-\*\/\^%]", query)
-        ),
-
-        "is_code": bool(
-            re.search(
-                r"\b(kod|function|class|php|javascript|python|api|hata|error|debug|yazılım|programlama)\b",
-                q
-            )
-        )
+        "is_math": is_math,
+        "is_code": any(word in q for word in code_words),
+        "query": q
     }
 
 
 # =========================================================
-# 5. SAFE MATH
+# 4. SAFE MATH
 # =========================================================
 
-_ALLOWED_OPERATORS = {
-    ast.Add: op.add,
-    ast.Sub: op.sub,
-    ast.Mult: op.mul,
-    ast.Div: op.truediv,
-    ast.Mod: op.mod,
-    ast.Pow: op.pow,
-    ast.USub: op.neg,
-    ast.UAdd: op.pos
+ALLOWED_OPERATORS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.Mod: operator.mod,
+    ast.Pow: operator.pow,
+    ast.USub: operator.neg,
+    ast.UAdd: operator.pos
 }
 
 
 def safe_math(expression):
-
-    expression = expression.replace("^", "**")
     expression = expression.replace(",", ".")
+    expression = expression.replace("^", "**")
 
-    def evaluate(node):
-
-        if isinstance(node, ast.Expression):
-            return evaluate(node.body)
-
-        if isinstance(node, ast.Constant):
-            if isinstance(node.value, (int, float)):
-                return node.value
-
-        if isinstance(node, ast.BinOp):
-            operator = _ALLOWED_OPERATORS.get(type(node.op))
-
-            if not operator:
-                raise ValueError()
-
-            left = evaluate(node.left)
-            right = evaluate(node.right)
-
-            if isinstance(node.op, ast.Pow) and abs(right) > 100:
-                raise ValueError()
-
-            return operator(left, right)
-
-        if isinstance(node, ast.UnaryOp):
-            operator = _ALLOWED_OPERATORS.get(type(node.op))
-
-            if not operator:
-                raise ValueError()
-
-            return operator(evaluate(node.operand))
-
-        raise ValueError()
+    if len(expression) > 100:
+        raise ValueError("Expression too long")
 
     tree = ast.parse(expression, mode="eval")
 
-    return evaluate(tree)
+    def calculate(node):
+        if isinstance(node, ast.Expression):
+            return calculate(node.body)
+
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, (int, float)):
+                if abs(node.value) > 10**12:
+                    raise ValueError("Number too large")
+                return node.value
+
+        if isinstance(node, ast.BinOp):
+            left = calculate(node.left)
+            right = calculate(node.right)
+
+            operation = ALLOWED_OPERATORS.get(type(node.op))
+
+            if operation is None:
+                raise ValueError("Operator not allowed")
+
+            if isinstance(node.op, ast.Pow) and abs(right) > 20:
+                raise ValueError("Exponent too large")
+
+            result = operation(left, right)
+
+            if abs(result) > 10**15:
+                raise ValueError("Result too large")
+
+            return result
+
+        if isinstance(node, ast.UnaryOp):
+            operation = ALLOWED_OPERATORS.get(type(node.op))
+
+            if operation is None:
+                raise ValueError("Operator not allowed")
+
+            return operation(calculate(node.operand))
+
+        raise ValueError("Invalid expression")
+
+    return calculate(tree)
 
 
 # =========================================================
-# 6. WEB SEARCH
+# 5. WEB SEARCH
 # =========================================================
 
-def web_search(query, parts):
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
+    "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/131.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/131.0 Safari/537.36"
+]
+
+
+def create_session():
+    session = requests.Session()
+
+    session.headers.update({
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7"
+    })
+
+    return session
+
+
+def github_search(query):
+    """
+    Public GitHub repository search.
+    Token zorunlu değildir.
+
+    Kod/yazılım sorularında GitHub kullanılır.
+    """
 
     results = []
 
-    user_agents = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/121.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
-    ]
-
-    headers = {
-        "User-Agent": random.choice(user_agents),
-        "Accept": "application/json, text/html, application/xhtml+xml, */*",
-        "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7"
-    }
-
-    session = requests.Session()
-    session.headers.update(headers)
-
-    # Google CSE
     try:
+        session = create_session()
 
-        cse_url = (
-            "https://cse.google.com/cse/element/v1"
-            "?rsz=filtered_cse"
-            "&num=5"
-            "&hl=tr"
-            "&source=gcsc"
-            "&cselibv=8a5d5b6de8c9f12f"
-            "&cx=f79f63e39ec7f4c78"
-            f"&q={urllib.parse.quote(query)}"
-            "&safe=off"
-            "&cse_tok="
-            "&exp=csqr,cc"
-            "&callback=cb"
-        )
+        params = {
+            "q": query,
+            "sort": "stars",
+            "order": "desc",
+            "per_page": 5
+        }
 
         response = session.get(
-            cse_url,
+            "https://api.github.com/search/repositories",
+            params=params,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2026-03-10"
+            },
             timeout=8
         )
 
-        match = re.search(
-            r"cb\((.*)\)",
-            response.text,
-            re.DOTALL
-        )
+        if response.status_code != 200:
+            return results
 
-        if match:
+        data = response.json()
 
-            google_data = json.loads(
-                match.group(1)
-            )
+        for item in data.get("items", [])[:5]:
+            description = item.get("description") or ""
 
-            for item in google_data.get("results", [])[:5]:
-
-                results.append({
-                    "title": item.get(
-                        "titleNoFormatting",
-                        ""
-                    ),
-                    "url": item.get(
-                        "unescapedUrl",
-                        ""
-                    ),
-                    "snippet": item.get(
-                        "contentNoFormatting",
-                        ""
-                    ),
-                    "source": "google"
-                })
+            results.append({
+                "title": item.get("full_name", ""),
+                "description": description,
+                "url": item.get("html_url", ""),
+                "stars": item.get("stargazers_count", 0),
+                "language": item.get("language") or "",
+                "source": "github"
+            })
 
     except Exception:
         pass
 
-    # Wikipedia
-    try:
+    return results
 
-        wiki_url = (
-            "https://tr.wikipedia.org/w/api.php"
-            "?action=query"
-            "&list=search"
-            f"&srsearch={urllib.parse.quote(query)}"
-            "&utf8="
-            "&format=json"
-            "&srlimit=3"
-        )
+
+def wikipedia_search(query):
+    results = []
+
+    try:
+        session = create_session()
+
+        params = {
+            "action": "query",
+            "list": "search",
+            "srsearch": query,
+            "utf8": 1,
+            "format": "json",
+            "srlimit": 5
+        }
 
         response = session.get(
-            wiki_url,
+            "https://tr.wikipedia.org/w/api.php",
+            params=params,
             timeout=8
         )
 
-        wiki_data = response.json()
+        if response.status_code != 200:
+            return results
 
-        for item in wiki_data.get(
-            "query",
-            {}
-        ).get("search", []):
+        data = response.json()
 
-            snippet = re.sub(
-                r"<[^>]+>",
-                "",
-                item.get("snippet", "")
-            )
-
+        for item in data.get("query", {}).get("search", [])[:5]:
             title = item.get("title", "")
+            snippet = item.get("snippet", "")
+
+            snippet = re.sub(r"<[^>]+>", "", snippet)
+            snippet = re.sub(r"\s+", " ", snippet).strip()
+
+            url = (
+                "https://tr.wikipedia.org/wiki/"
+                + urllib.parse.quote(title.replace(" ", "_"))
+            )
 
             results.append({
                 "title": title,
-                "url":
-                    "https://tr.wikipedia.org/wiki/"
-                    + urllib.parse.quote(
-                        title.replace(" ", "_")
-                    ),
-                "snippet": snippet,
+                "description": snippet,
+                "url": url,
                 "source": "wikipedia"
             })
 
     except Exception:
         pass
 
-    # GitHub
-    if parts["is_code"]:
-
-        try:
-
-            github_url = (
-                "https://api.github.com/search/repositories"
-                f"?q={urllib.parse.quote(query)}"
-                "&sort=stars"
-                "&per_page=3"
-            )
-
-            response = session.get(
-                github_url,
-                timeout=8
-            )
-
-            if response.status_code == 200:
-
-                for item in response.json().get(
-                    "items",
-                    []
-                ):
-
-                    results.append({
-                        "title": item.get(
-                            "full_name",
-                            ""
-                        ),
-                        "url": item.get(
-                            "html_url",
-                            ""
-                        ),
-                        "snippet": item.get(
-                            "description",
-                            ""
-                        ) or "Açıklama yok.",
-                        "source": "github"
-                    })
-
-        except Exception:
-            pass
-
     return results
 
 
-def synthesize_results(query, results):
+def search_web(query, parts):
+    """
+    Kod sorularında:
+        GitHub
 
+    Diğer sorularda:
+        Wikipedia
+
+    Böylece GitHub sonuçları normal sorulara gereksiz şekilde
+    karışmaz.
+    """
+
+    if parts["is_code"]:
+        return github_search(query)
+
+    return wikipedia_search(query)
+
+
+# =========================================================
+# 6. ANSWER BUILDER
+# =========================================================
+
+def clean_text(text):
+    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def choose_best_result(results):
     if not results:
         return None
 
-    lines = []
-    seen = set()
+    cleaned = []
 
     for result in results:
+        title = clean_text(result.get("title", ""))
+        description = clean_text(
+            result.get("description", "")
+        )
 
-        url = result.get("url", "")
-
-        if not url or url in seen:
+        if not title and not description:
             continue
 
-        seen.add(url)
+        cleaned.append({
+            **result,
+            "title": title,
+            "description": description
+        })
 
-        snippet = result.get(
-            "snippet",
-            ""
+    if not cleaned:
+        return None
+
+    # GitHub için yıldız sayısını da hesaba kat.
+    if cleaned[0].get("source") == "github":
+        cleaned.sort(
+            key=lambda x: x.get("stars", 0),
+            reverse=True
         )
 
-        if len(snippet) > 220:
-            snippet = snippet[:217] + "..."
+    return cleaned[0]
 
-        line = (
-            f"• [{result.get('source', '').upper()}] "
-            f"{result.get('title', '')}"
+
+def build_normal_answer(query, results):
+    """
+    Arama sonuçlarını kullanıcıya ham şekilde göstermiyoruz.
+    En uygun sonucu seçip doğal bir cevap haline getiriyoruz.
+    """
+
+    if not results:
+        return (
+            "Bu konuda güvenilir bir bilgi bulamadım. "
+            "İstersen soruyu biraz daha ayrıntılı yazabilirsin."
         )
 
-        if snippet:
-            line += f"\n{snippet}"
+    best = choose_best_result(results)
 
-        line += f"\n{url}"
+    if not best:
+        return (
+            "Arama yaptım fakat kullanılabilir bir sonuç "
+            "bulamadım."
+        )
 
-        lines.append(line)
+    title = best.get("title", "")
+    description = best.get("description", "")
+    source = best.get("source", "")
 
-        if len(lines) >= 5:
-            break
+    if source == "github":
+        language = best.get("language", "")
+        stars = best.get("stars", 0)
 
-    return (
-        f'"{query}" hakkında bulduklarım:\n\n'
-        + "\n\n".join(lines)
-    )
+        answer_parts = []
+
+        answer_parts.append(
+            f"{query} konusunda GitHub'daki en uygun "
+            f"kaynaklardan biri **{title}**."
+        )
+
+        if description:
+            answer_parts.append(description)
+
+        extra = []
+
+        if language:
+            extra.append(f"Dil: {language}")
+
+        if stars:
+            extra.append(f"⭐ {stars:,} yıldız".replace(",", "."))
+
+        if extra:
+            answer_parts.append(" • ".join(extra))
+
+        answer_parts.append(
+            f"Kaynak: {best.get('url', '')}"
+        )
+
+        return "\n\n".join(answer_parts)
+
+    # Wikipedia
+    answer_parts = []
+
+    if title:
+        answer_parts.append(
+            f"**{query}** hakkında bulduğum en uygun bilgi:"
+        )
+
+    if description:
+        answer_parts.append(description)
+
+    if title:
+        answer_parts.append(
+            f"Kaynak: {best.get('url', '')}"
+        )
+
+    return "\n\n".join(answer_parts)
 
 
 # =========================================================
-# 7. AI ENGINE
+# 7. MAIN AI ENGINE
 # =========================================================
 
 def get_answer(kelime):
-
     normalized = normalize(kelime)
-
     parts = analyze_query(kelime)
 
+    # Greeting
     if parts["is_greeting"]:
+        return (
+            random.choice([
+                "Selam! Ben Vantorium. Hazırım, ne hakkında konuşalım?",
+                "Merhaba! Vantorium hazır. Sana nasıl yardımcı olabilirim?",
+                "Selam kral! Ne araştırmamı veya çözmemi istersin?"
+            ]),
+            "selamlama"
+        )
 
-        return random.choice([
-            "Merhaba! Ben Vantorium. Sana nasıl yardımcı olabilirim?",
-            "Selam! Vantorium hazır. Ne hakkında konuşalım?",
-            "Selam kral! Ne yapmak istiyorsun?"
-        ]), "selamlama"
-
+    # Math
     if parts["is_math"]:
-
         try:
-
             result = safe_math(kelime)
+
+            if isinstance(result, float) and result.is_integer():
+                result = int(result)
 
             return f"Sonuç: {result}", "matematik"
 
         except Exception:
-
             return (
-                "Matematik ifadesini çözemedim.",
+                "Bu matematik ifadesini güvenli şekilde çözemedim.",
                 "hata"
             )
 
-    if normalized in DATASET:
+    # Dataset
+    if normalized in DATASET and DATASET[normalized]:
+        return (
+            random.choice(DATASET[normalized]),
+            "veri_seti"
+        )
 
-        if DATASET[normalized]:
-
-            return (
-                random.choice(
-                    DATASET[normalized]
-                ),
-                "veri_seti"
-            )
-
+    # Memory
     cached = memory_get(normalized)
 
     if cached:
-
         return cached, "hafiza"
 
-    results = web_search(
-        kelime,
-        parts
-    )
+    # Search
+    results = search_web(kelime, parts)
 
     if results:
-
-        answer = synthesize_results(
+        answer = build_normal_answer(
             kelime,
             results
         )
@@ -555,14 +627,18 @@ def get_answer(kelime):
         memory_save(
             normalized,
             answer,
-            0.8,
+            0.85,
+            results[0].get("source", "web")
+        )
+
+        return answer, results[0].get(
+            "source",
             "web"
         )
 
-        return answer, "web"
-
     return (
-        "Bunu bilmiyorum, internette de bulamadım.",
+        "Bunu şu anda bilmiyorum ve kullanılabilir "
+        "bir kaynak da bulamadım.",
         "bulunamadi"
     )
 
@@ -572,10 +648,7 @@ def get_answer(kelime):
 # =========================================================
 
 def get_current_user():
-
-    token = request.cookies.get(
-        "session_token"
-    )
+    token = request.cookies.get("session_token")
 
     if not token:
         return None
@@ -596,10 +669,8 @@ def get_current_user():
 
 
 def login_required(func):
-
     @wraps(func)
     def decorated(*args, **kwargs):
-
         if not get_current_user():
             return redirect("/login")
 
@@ -609,23 +680,22 @@ def login_required(func):
 
 
 # =========================================================
-# 9. PREMIUM INTER UI
+# 9. UI
 # =========================================================
 
-BASE_STYLE = r"""
+BASE_STYLE = """
 <style>
 
 :root {
-    --bg: #07090c;
-    --panel: #0d1117;
-    --panel-2: #111720;
+    --bg: #07090d;
+    --panel: #0e1117;
+    --panel2: #12161d;
     --border: rgba(255,255,255,.08);
-    --text: #f5f7fa;
-    --muted: #8d98a7;
-    --green: #18c88f;
-    --green-2: #0e9f72;
-    --danger: #ff5d6c;
-    --shadow: 0 25px 80px rgba(0,0,0,.45);
+    --muted: #8b93a1;
+    --text: #f4f7fb;
+    --green: #18d49b;
+    --green2: #0ea878;
+    --danger: #ef4444;
 }
 
 * {
@@ -634,8 +704,9 @@ BASE_STYLE = r"""
     padding: 0;
 }
 
-html {
-    scroll-behavior: smooth;
+html,
+body {
+    min-height: 100%;
 }
 
 body {
@@ -644,25 +715,21 @@ body {
         -apple-system,
         BlinkMacSystemFont,
         "Segoe UI",
+        Roboto,
         sans-serif;
 
     background:
         radial-gradient(
-            circle at 15% 10%,
-            rgba(24,200,143,.09),
-            transparent 28%
-        ),
-        radial-gradient(
-            circle at 85% 20%,
-            rgba(70,100,255,.07),
-            transparent 30%
+            circle at 50% -20%,
+            rgba(24,212,155,.12),
+            transparent 40%
         ),
         var(--bg);
 
     color: var(--text);
-    min-height: 100vh;
 
     -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
 }
 
 a {
@@ -672,24 +739,28 @@ a {
 
 button,
 input {
-    font-family: inherit;
+    font: inherit;
 }
 
-/* NAVBAR */
+
+/* =====================================================
+   NAVBAR
+===================================================== */
 
 .navbar {
+    position: sticky;
+    top: 0;
+    z-index: 100;
+
     height: 68px;
-    padding: 0 26px;
 
     display: flex;
     align-items: center;
     justify-content: space-between;
 
-    position: sticky;
-    top: 0;
-    z-index: 1000;
+    padding: 0 22px;
 
-    background: rgba(7,9,12,.72);
+    background: rgba(7,9,13,.78);
     backdrop-filter: blur(22px);
     -webkit-backdrop-filter: blur(22px);
 
@@ -718,12 +789,12 @@ input {
     background:
         linear-gradient(
             135deg,
-            #21dca0,
-            #07885f
+            #1ee6a9,
+            #0d9b74
         );
 
     box-shadow:
-        0 8px 25px rgba(24,200,143,.25);
+        0 8px 30px rgba(24,212,155,.2);
 
     font-weight: 900;
 }
@@ -739,137 +810,132 @@ input {
 
     border-radius: 9px;
 
-    color: #9aa4b2;
+    color: #9ba3b0;
 
     font-size: 13px;
     font-weight: 600;
 
     transition:
         .2s ease;
-
-    border: 1px solid transparent;
 }
 
 .btn-nav:hover {
     color: white;
-    background: rgba(255,255,255,.055);
+    background: rgba(255,255,255,.06);
 }
 
 .btn-nav.primary {
-    color: white;
+    color: #04140f;
 
-    background:
-        linear-gradient(
-            135deg,
-            var(--green),
-            var(--green-2)
-        );
+    background: var(--green);
 
     box-shadow:
-        0 7px 25px rgba(24,200,143,.18);
+        0 8px 25px rgba(24,212,155,.16);
 }
 
 .btn-nav.primary:hover {
-    transform: translateY(-1px);
+    background: #2be8ae;
 }
 
-/* GENERAL */
 
-.auth-wrapper {
-    min-height: calc(100vh - 68px);
+/* =====================================================
+   AUTH
+===================================================== */
+
+.auth-page {
+    min-height:
+        calc(100vh - 68px);
 
     display: flex;
     align-items: center;
     justify-content: center;
 
-    padding: 35px 20px;
+    padding: 35px 18px;
 }
 
-.container {
+.auth-panel {
     width: 100%;
     max-width: 430px;
 
-    padding: 34px;
+    padding: 30px;
 
     background:
         linear-gradient(
-            145deg,
-            rgba(17,23,32,.96),
-            rgba(10,14,20,.96)
+            180deg,
+            rgba(18,22,29,.97),
+            rgba(11,14,19,.97)
         );
 
-    border:
-        1px solid var(--border);
+    border: 1px solid var(--border);
 
     border-radius: 22px;
 
-    box-shadow: var(--shadow);
+    box-shadow:
+        0 30px 100px rgba(0,0,0,.45);
 
-    position: relative;
-    overflow: hidden;
+    animation:
+        panelIn .35s ease;
 }
 
-.container::before {
-    content: "";
+@keyframes panelIn {
+    from {
+        opacity: 0;
+        transform: translateY(12px) scale(.98);
+    }
 
-    position: absolute;
-
-    width: 180px;
-    height: 180px;
-
-    top: -90px;
-    right: -80px;
-
-    background: rgba(24,200,143,.13);
-
-    filter: blur(50px);
-
-    pointer-events: none;
+    to {
+        opacity: 1;
+        transform: none;
+    }
 }
-
-.container.wide {
-    max-width: 1000px;
-    margin: 38px auto;
-}
-
-/* AUTH */
 
 .auth-brand {
-    display: flex;
-    justify-content: center;
-    margin-bottom: 22px;
+    text-align: center;
+    margin-bottom: 25px;
 }
 
-.auth-brand .logo-icon {
+.auth-brand .mini-logo {
     width: 50px;
     height: 50px;
 
+    margin: 0 auto 15px;
+
+    display: flex;
+    align-items: center;
+    justify-content: center;
+
     border-radius: 15px;
 
-    font-size: 20px;
+    background:
+        linear-gradient(
+            135deg,
+            #1ee6a9,
+            #0b956e
+        );
+
+    font-size: 21px;
+    font-weight: 900;
+
+    box-shadow:
+        0 15px 45px rgba(24,212,155,.18);
 }
 
-.auth-title {
-    text-align: center;
-
-    font-size: 25px;
-    font-weight: 800;
-
-    letter-spacing: -.8px;
-
-    margin-bottom: 8px;
+.auth-brand h1 {
+    font-size: 23px;
+    letter-spacing: -.7px;
 }
 
-.auth-subtitle {
-    text-align: center;
+.auth-brand p {
+    margin-top: 7px;
 
     color: var(--muted);
 
     font-size: 13px;
+    line-height: 1.5;
+}
 
-    line-height: 1.6;
-
-    margin-bottom: 25px;
+.form-group {
+    margin-bottom: 16px;
 }
 
 label {
@@ -877,7 +943,7 @@ label {
 
     margin-bottom: 7px;
 
-    color: #cbd2db;
+    color: #cbd1da;
 
     font-size: 12px;
     font-weight: 700;
@@ -885,16 +951,13 @@ label {
 
 input[type=text],
 input[type=password] {
-
     width: 100%;
 
     padding: 13px 14px;
 
-    margin-bottom: 17px;
-
     color: white;
 
-    background: #080c11;
+    background: #080b10;
 
     border: 1px solid rgba(255,255,255,.09);
 
@@ -902,439 +965,324 @@ input[type=password] {
 
     outline: none;
 
-    font-size: 14px;
-
     transition: .2s ease;
 }
 
 input:focus {
-
-    border-color:
-        rgba(24,200,143,.65);
+    border-color: rgba(24,212,155,.65);
 
     box-shadow:
-        0 0 0 4px
-        rgba(24,200,143,.08);
+        0 0 0 4px rgba(24,212,155,.09);
 }
 
-.btn {
-
+.main-btn {
     width: 100%;
-
-    border: 0;
-
-    padding: 13px 16px;
-
-    border-radius: 11px;
-
-    color: white;
-
-    background:
-        linear-gradient(
-            135deg,
-            var(--green),
-            var(--green-2)
-        );
-
-    font-size: 14px;
-    font-weight: 700;
-
-    cursor: pointer;
-
-    transition:
-        transform .18s ease,
-        box-shadow .18s ease,
-        opacity .18s ease;
-}
-
-.btn:hover {
-
-    transform: translateY(-1px);
-
-    box-shadow:
-        0 10px 30px
-        rgba(24,200,143,.2);
-}
-
-.btn:active {
-    transform: translateY(0);
-}
-
-.btn.secondary {
-    background: #171d25;
-}
-
-.btn.danger {
-    background:
-        linear-gradient(
-            135deg,
-            #ff6472,
-            #d93648
-        );
-}
-
-.btn-small {
-    width: auto;
-    padding: 10px 14px;
-}
-
-.auth-links {
-
-    display: flex;
-    align-items: center;
-    justify-content: center;
-
-    gap: 5px;
-
-    margin-top: 19px;
-
-    color: var(--muted);
-
-    font-size: 13px;
-}
-
-.auth-links a {
-    color: #48e4b2;
-    font-weight: 700;
-}
-
-.policy-box {
-
-    margin-top: 22px;
 
     padding: 13px;
 
-    border:
-        1px solid rgba(255,255,255,.07);
+    border: 0;
+    border-radius: 11px;
 
-    background:
-        rgba(255,255,255,.025);
+    cursor: pointer;
 
-    border-radius: 12px;
+    color: #03140f;
 
-    text-align: center;
-}
+    background: var(--green);
 
-.policy-box-title {
-
-    color: #dce2e8;
-
-    font-size: 12px;
-    font-weight: 700;
-
-    margin-bottom: 5px;
-}
-
-.policy-box-text {
-
-    color: #727d8c;
-
-    font-size: 11px;
-
-    line-height: 1.5;
-
-    margin-bottom: 9px;
-}
-
-.policy-link {
-
-    display: inline-flex;
-
-    align-items: center;
-    justify-content: center;
-
-    padding: 7px 11px;
-
-    border-radius: 8px;
-
-    background: rgba(24,200,143,.08);
-
-    color: #4de5b5;
-
-    font-size: 11px;
-    font-weight: 700;
-
-    border:
-        1px solid rgba(24,200,143,.14);
+    font-weight: 800;
 
     transition: .2s ease;
 }
 
-.policy-link:hover {
-    background: rgba(24,200,143,.15);
+.main-btn:hover {
+    background: #2be8ae;
+
+    transform: translateY(-1px);
 }
 
 .error {
-
     margin-bottom: 17px;
 
     padding: 12px 13px;
 
-    border-radius: 10px;
+    border-radius: 11px;
 
-    color: #ff8993;
+    background: rgba(239,68,68,.08);
 
-    background: rgba(255,77,94,.07);
+    border: 1px solid rgba(239,68,68,.16);
 
-    border:
-        1px solid rgba(255,77,94,.14);
+    color: #ff8b8b;
 
-    font-size: 12px;
+    font-size: 13px;
 }
 
-/* DASHBOARD */
 
-.page-header {
-    margin-bottom: 24px;
-}
+/* POLICY BOX */
 
-.page-title {
-    font-size: 30px;
-    font-weight: 800;
-    letter-spacing: -1px;
-}
+.policy-box {
+    margin-top: 22px;
 
-.page-subtitle {
-    margin-top: 7px;
-    color: var(--muted);
-    font-size: 14px;
-}
+    padding: 15px;
 
-.grid {
-
-    display: grid;
-
-    grid-template-columns:
-        repeat(2, minmax(0, 1fr));
-
-    gap: 17px;
-}
-
-.card {
-
-    padding: 23px;
-
-    border-radius: 17px;
+    border-radius: 14px;
 
     background:
-        rgba(13,17,23,.88);
+        rgba(255,255,255,.025);
 
     border:
-        1px solid var(--border);
-
-    box-shadow:
-        0 15px 50px rgba(0,0,0,.17);
-
-    margin-bottom: 17px;
+        1px solid rgba(255,255,255,.07);
 }
 
-.card h3 {
-
+.policy-title {
     display: flex;
     align-items: center;
     gap: 9px;
 
-    margin-bottom: 13px;
+    margin-bottom: 7px;
+
+    font-size: 13px;
+    font-weight: 800;
+}
+
+.policy-icon {
+    width: 28px;
+    height: 28px;
+
+    display: flex;
+    align-items: center;
+    justify-content: center;
+
+    border-radius: 8px;
+
+    background: rgba(24,212,155,.1);
+
+    color: var(--green);
+}
+
+.policy-box p {
+    color: #7f8794;
+
+    font-size: 12px;
+    line-height: 1.55;
+
+    margin-bottom: 10px;
+}
+
+.policy-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+
+    color: var(--green);
+
+    font-size: 12px;
+    font-weight: 700;
+}
+
+.auth-switch {
+    text-align: center;
+
+    margin-top: 18px;
+
+    color: #747d8b;
+
+    font-size: 13px;
+}
+
+.auth-switch a {
+    color: var(--green);
+    font-weight: 700;
+}
+
+
+/* =====================================================
+   DASHBOARD
+===================================================== */
+
+.container {
+    width: 100%;
+    max-width: 980px;
+
+    margin: 0 auto;
+
+    padding: 42px 20px;
+}
+
+.page-title {
+    font-size: 30px;
+    letter-spacing: -1px;
+}
+
+.subtitle {
+    margin-top: 7px;
+
+    color: var(--muted);
+
+    font-size: 14px;
+    line-height: 1.6;
+}
+
+.card {
+    margin-top: 20px;
+
+    padding: 24px;
+
+    background:
+        rgba(14,17,23,.9);
+
+    border: 1px solid var(--border);
+
+    border-radius: 17px;
+}
+
+.card h3 {
+    margin-bottom: 14px;
 
     font-size: 15px;
 }
 
 .card p {
-
-    color: #9ba5b2;
+    color: #929aa7;
 
     font-size: 13px;
-
     line-height: 1.7;
 }
 
 .api-key-box {
+    margin-top: 12px;
 
     padding: 14px;
 
-    margin-bottom: 11px;
+    background: #080b10;
 
-    color: #5ce6b9;
-
-    background: #070a0e;
-
-    border:
-        1px solid rgba(24,200,143,.12);
+    border: 1px solid rgba(255,255,255,.07);
 
     border-radius: 10px;
 
-    font-family:
-        "SFMono-Regular",
-        Consolas,
-        monospace;
+    color: var(--green);
 
-    font-size: 12px;
+    font-family: monospace;
 
     word-break: break-all;
 }
 
 .code-block {
+    margin-top: 12px;
 
-    padding: 14px;
-
-    margin: 12px 0;
+    padding: 15px;
 
     background: #070a0e;
 
-    border:
-        1px solid rgba(255,255,255,.07);
+    border: 1px solid rgba(255,255,255,.07);
 
     border-radius: 10px;
 
-    font-family:
-        "SFMono-Regular",
-        Consolas,
-        monospace;
+    overflow-x: auto;
+
+    color: #cfd6df;
+
+    font-family: monospace;
 
     font-size: 12px;
 
-    color: #b9c3cf;
-
-    overflow-x: auto;
-
     line-height: 1.6;
 }
 
-.section-title {
+.small-danger {
+    margin-top: 14px;
 
-    margin:
-        35px 0 14px;
+    padding: 10px 14px;
 
-    font-size: 18px;
+    border: 0;
+    border-radius: 9px;
 
-    font-weight: 800;
+    color: white;
+
+    background: var(--danger);
+
+    cursor: pointer;
+
+    font-size: 12px;
+    font-weight: 700;
 }
 
-.card ul {
-    list-style: none;
-}
 
-.card li {
+/* =====================================================
+   CHAT
+===================================================== */
 
-    padding: 11px 0;
-
-    color: #9da7b4;
-
-    border-bottom:
-        1px solid rgba(255,255,255,.055);
-
-    font-size: 13px;
-
-    line-height: 1.6;
-}
-
-.card li:last-child {
-    border-bottom: 0;
-}
-
-.card li::before {
-
-    content: "✓";
-
-    color: #35dba7;
-
-    font-weight: 800;
-
-    margin-right: 9px;
-}
-
-.footer {
-
-    padding: 30px 0;
-
-    text-align: center;
-
-    color: #596372;
-
-    font-size: 11px;
-}
-
-/* CHAT */
-
-.chat-page {
-
+.chat-shell {
     height:
         calc(100vh - 68px);
 
     display: flex;
     flex-direction: column;
-}
 
-.chat-layout {
+    max-width: 980px;
+
+    margin: 0 auto;
 
     width: 100%;
-    max-width: 930px;
-
-    margin: auto;
-
-    flex: 1;
-
-    display: flex;
-    flex-direction: column;
-
-    padding:
-        0 20px;
 }
 
 .chat-history {
-
     flex: 1;
 
     overflow-y: auto;
 
     padding:
-        30px 0;
+        28px
+        20px
+        160px;
 
     scrollbar-width: thin;
+}
 
-    scrollbar-color:
-        #252d38 transparent;
+.chat-history::-webkit-scrollbar {
+    width: 5px;
+}
+
+.chat-history::-webkit-scrollbar-thumb {
+    background: #252b34;
+
+    border-radius: 20px;
 }
 
 .chat-msg {
+    width: 100%;
+    max-width: 850px;
+
+    margin: 0 auto 25px;
 
     display: flex;
 
     gap: 12px;
 
-    width: 100%;
-
-    margin-bottom: 24px;
-
     animation:
-        messageIn .2s ease;
+        msgIn .25s ease;
 }
 
-@keyframes messageIn {
-
+@keyframes msgIn {
     from {
         opacity: 0;
-        transform:
-            translateY(5px);
+        transform: translateY(5px);
     }
 
     to {
         opacity: 1;
-        transform:
-            translateY(0);
+        transform: none;
     }
 }
 
 .chat-msg.user {
-    flex-direction: row-reverse;
+    justify-content: flex-end;
 }
 
 .avatar {
+    width: 35px;
+    height: 35px;
 
-    width: 34px;
-    height: 34px;
-
-    min-width: 34px;
+    flex: 0 0 35px;
 
     display: flex;
     align-items: center;
@@ -1343,109 +1291,177 @@ input:focus {
     border-radius: 11px;
 
     font-size: 12px;
-    font-weight: 800;
+    font-weight: 900;
 }
 
 .chat-msg.ai .avatar {
-
     background:
         linear-gradient(
             135deg,
-            var(--green),
-            var(--green-2)
+            #19d9a0,
+            #0b986f
         );
 
+    color: #03140f;
+
     box-shadow:
-        0 6px 20px
-        rgba(24,200,143,.15);
+        0 8px 25px rgba(24,212,155,.12);
 }
 
 .chat-msg.user .avatar {
-    background: #1c232d;
+    order: 2;
+
+    background: #1c222c;
+
+    color: white;
 }
 
 .msg-content {
+    max-width: min(720px, 78%);
 
-    max-width: 76%;
+    color: #e7ebf0;
 
-    color: #dfe5ec;
-
-    font-size: 14px;
-
+    font-size: 15px;
     line-height: 1.75;
 
     white-space: pre-wrap;
 
-    overflow-wrap: anywhere;
-
-    padding-top: 5px;
+    word-break: break-word;
 }
 
 .chat-msg.user .msg-content {
+    order: 1;
 
     padding:
-        11px 15px;
+        11px
+        15px;
 
     border-radius: 16px;
 
     border-top-right-radius: 5px;
 
     background:
-        #171d25;
-
-    color: #f1f4f7;
+        #171d26;
 }
 
-.chat-input-area {
+
+/* thinking */
+
+.thinking-box {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+
+    padding-top: 1px;
+}
+
+.thinking-main {
+    color: #dfe6ed;
+
+    font-weight: 600;
+}
+
+.thinking-status {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+
+    color: #788291;
+
+    font-size: 12px;
+}
+
+.loader {
+    width: 8px;
+    height: 8px;
+
+    border-radius: 50%;
+
+    background: var(--green);
+
+    box-shadow:
+        0 0 15px rgba(24,212,155,.65);
+
+    animation:
+        pulse 1s infinite;
+}
+
+@keyframes pulse {
+    0%,100% {
+        opacity: .3;
+        transform: scale(.75);
+    }
+
+    50% {
+        opacity: 1;
+        transform: scale(1);
+    }
+}
+
+
+/* INPUT */
+
+.chat-composer {
+    position: fixed;
+
+    left: 50%;
+
+    bottom: 0;
+
+    transform: translateX(-50%);
+
+    width: min(900px, calc(100% - 28px));
 
     padding:
-        12px 0 24px;
+        15px
+        0
+        22px;
 
     background:
         linear-gradient(
+            to bottom,
             transparent,
-            var(--bg) 30%
+            var(--bg) 25%
         );
+
+    z-index: 20;
 }
 
-.chat-input-box {
-
+.composer-box {
     position: relative;
 
-    max-width: 800px;
-
-    margin: auto;
-}
-
-.chat-input-box input {
-
-    width: 100%;
-
-    margin: 0;
-
-    padding:
-        16px 58px 16px 18px;
-
-    border-radius: 15px;
-
-    background:
-        rgba(13,17,23,.96);
+    background: #11161e;
 
     border:
-        1px solid rgba(255,255,255,.1);
+        1px solid rgba(255,255,255,.09);
+
+    border-radius: 17px;
 
     box-shadow:
-        0 12px 40px rgba(0,0,0,.3);
+        0 20px 60px rgba(0,0,0,.4);
+}
+
+.composer-box input {
+    width: 100%;
+
+    padding:
+        17px
+        58px
+        17px
+        17px;
 
     color: white;
+
+    background: transparent;
+
+    border: 0;
 
     outline: none;
 
     font-size: 14px;
 }
 
-.chat-input-box button {
-
+.send-btn {
     position: absolute;
 
     right: 8px;
@@ -1461,41 +1477,102 @@ input:focus {
 
     border-radius: 11px;
 
-    background:
-        linear-gradient(
-            135deg,
-            var(--green),
-            var(--green-2)
-        );
-
-    color: white;
-
     display: flex;
     align-items: center;
     justify-content: center;
 
+    color: #03140f;
+
+    background: var(--green);
+
     cursor: pointer;
 
-    transition: .18s ease;
+    transition: .2s ease;
 }
 
-.chat-input-box button:hover {
+.send-btn:hover {
     transform:
         translateY(-50%)
         scale(1.04);
 }
 
-/* MOBILE */
+.send-btn:disabled {
+    opacity: .45;
+    cursor: not-allowed;
+}
 
-@media (max-width: 700px) {
+
+/* =====================================================
+   INFO
+===================================================== */
+
+.info-card {
+    margin-top: 18px;
+
+    padding: 22px;
+
+    background: rgba(14,17,23,.9);
+
+    border: 1px solid var(--border);
+
+    border-radius: 16px;
+}
+
+.info-card h2 {
+    margin-bottom: 11px;
+
+    font-size: 16px;
+}
+
+.info-card p,
+.info-card li {
+    color: #929aa7;
+
+    font-size: 13px;
+    line-height: 1.8;
+}
+
+.info-card ul {
+    padding-left: 19px;
+}
+
+.footer {
+    padding: 35px 20px;
+
+    text-align: center;
+
+    color: #555d69;
+
+    font-size: 12px;
+}
+
+
+/* =====================================================
+   MOBILE
+===================================================== */
+
+@media(max-width: 650px) {
 
     .navbar {
-        padding: 0 13px;
-        height: 62px;
+        height: 60px;
+
+        padding:
+            0 13px;
+    }
+
+    .nav-actions {
+        gap: 2px;
+    }
+
+    .btn-nav {
+        padding:
+            8px 7px;
+
+        font-size: 11px;
     }
 
     .logo {
-        font-size: 14px;
+        font-size: 15px;
     }
 
     .logo-icon {
@@ -1503,48 +1580,75 @@ input:focus {
         height: 30px;
     }
 
-    .btn-nav {
-        padding: 7px 8px;
-        font-size: 11px;
+    .auth-page {
+        min-height:
+            calc(100vh - 60px);
+
+        padding:
+            18px 13px;
+    }
+
+    .auth-panel {
+        padding: 22px 18px;
+
+        border-radius: 19px;
     }
 
     .container {
-        padding: 25px 20px;
-        border-radius: 18px;
-    }
-
-    .container.wide {
-        margin: 20px 12px;
-    }
-
-    .grid {
-        grid-template-columns: 1fr;
+        padding:
+            27px 14px;
     }
 
     .page-title {
         font-size: 25px;
     }
 
-    .chat-layout {
-        padding: 0 12px;
+    .chat-shell {
+        height:
+            calc(100vh - 60px);
+    }
+
+    .chat-history {
+        padding:
+            20px
+            12px
+            145px;
+    }
+
+    .chat-msg {
+        gap: 9px;
+        margin-bottom: 21px;
+    }
+
+    .avatar {
+        width: 31px;
+        height: 31px;
+        flex-basis: 31px;
     }
 
     .msg-content {
         max-width: 82%;
-        font-size: 13px;
+
+        font-size: 14px;
+        line-height: 1.65;
     }
 
-    .auth-wrapper {
-        padding: 20px 14px;
+    .chat-composer {
+        width:
+            calc(100% - 18px);
+
+        padding-bottom: 13px;
     }
+
 }
 
 </style>
 
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+
 <link
-    href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap"
+    href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap"
     rel="stylesheet"
 >
 """
@@ -1554,12 +1658,7 @@ input:focus {
 # 10. PAGE RENDER
 # =========================================================
 
-def render_page(
-    title,
-    content,
-    user=None,
-    show_nav=True
-):
+def render_page(title, content, user=None, show_nav=True):
 
     nav = ""
 
@@ -1568,17 +1667,34 @@ def render_page(
         if user:
 
             actions = """
-                <a href="/chat" class="btn-nav">Sohbet</a>
-                <a href="/dashboard" class="btn-nav">Dashboard</a>
-                <a href="/info" class="btn-nav">Bilgi</a>
-                <a href="/logout" class="btn-nav">Çıkış</a>
+                <a href="/dashboard" class="btn-nav">
+                    Dashboard
+                </a>
+
+                <a href="/chat" class="btn-nav">
+                    Sohbet
+                </a>
+
+                <a href="/info" class="btn-nav">
+                    Bilgi
+                </a>
+
+                <a href="/logout" class="btn-nav">
+                    Çıkış
+                </a>
             """
 
         else:
 
             actions = """
-                <a href="/info" class="btn-nav">Bilgi</a>
-                <a href="/login" class="btn-nav">Giriş</a>
+                <a href="/info" class="btn-nav">
+                    Bilgi
+                </a>
+
+                <a href="/login" class="btn-nav">
+                    Giriş
+                </a>
+
                 <a href="/register" class="btn-nav primary">
                     Kayıt Ol
                 </a>
@@ -1588,8 +1704,8 @@ def render_page(
         <nav class="navbar">
 
             <a href="/" class="logo">
-                <div class="logo-icon">V</div>
-                <span>Vantorium</span>
+                <span class="logo-icon">V</span>
+                Vantorium
             </a>
 
             <div class="nav-actions">
@@ -1600,46 +1716,195 @@ def render_page(
         """
 
     return f"""
-    <!DOCTYPE html>
+<!DOCTYPE html>
 
-    <html lang="tr">
+<html lang="tr">
 
-    <head>
+<head>
 
-        <meta charset="UTF-8">
+<meta charset="UTF-8">
 
-        <meta
-            name="viewport"
-            content="width=device-width, initial-scale=1.0"
-        >
+<meta
+    name="viewport"
+    content="width=device-width, initial-scale=1.0, viewport-fit=cover"
+>
 
-        <meta
-            name="theme-color"
-            content="#07090c"
-        >
+<meta
+    name="theme-color"
+    content="#07090d"
+>
 
-        <title>
-            {html.escape(title)} | Vantorium
-        </title>
+<title>{title} | Vantorium</title>
 
-        {BASE_STYLE}
+{BASE_STYLE}
 
-    </head>
+</head>
 
-    <body>
+<body>
 
-        {nav}
+{nav}
 
-        {content}
+{content}
 
-    </body>
+</body>
 
-    </html>
-    """
+</html>
+"""
 
 
 # =========================================================
-# 11. HOME
+# 11. AUTH PAGE
+# =========================================================
+
+def auth_page(
+    title,
+    heading,
+    description,
+    action,
+    action_text,
+    switch_text,
+    switch_link,
+    switch_label,
+    error=None
+):
+
+    error_html = ""
+
+    if error:
+        error_html = f"""
+        <div class="error">
+            {error}
+        </div>
+        """
+
+    content = f"""
+    <main class="auth-page">
+
+        <section class="auth-panel">
+
+            <div class="auth-brand">
+
+                <div class="mini-logo">
+                    V
+                </div>
+
+                <h1>
+                    {heading}
+                </h1>
+
+                <p>
+                    {description}
+                </p>
+
+            </div>
+
+            {error_html}
+
+            <form
+                method="POST"
+                action="{action}"
+            >
+
+                <div class="form-group">
+
+                    <label>
+                        Kullanıcı Adı
+                    </label>
+
+                    <input
+                        type="text"
+                        name="username"
+                        required
+                        autocomplete="username"
+                        placeholder="kullanici_adi"
+                    >
+
+                </div>
+
+                <div class="form-group">
+
+                    <label>
+                        Şifre
+                    </label>
+
+                    <input
+                        type="password"
+                        name="password"
+                        required
+                        autocomplete="{
+                            'new-password'
+                            if action == '/register'
+                            else 'current-password'
+                        }"
+                        placeholder="••••••••"
+                    >
+
+                </div>
+
+                <button
+                    type="submit"
+                    class="main-btn"
+                >
+                    {action_text}
+                </button>
+
+            </form>
+
+
+            <!-- KURALLAR / POLİTİKALAR -->
+
+            <div class="policy-box">
+
+                <div class="policy-title">
+
+                    <span class="policy-icon">
+                        ✓
+                    </span>
+
+                    Kurallar ve Politikalar
+
+                </div>
+
+                <p>
+                    Vantorium'u kullanarak hizmet şartlarını,
+                    kullanım kurallarını ve gizlilik politikasını
+                    kabul etmiş olursun.
+                </p>
+
+                <a
+                    href="https://api-vantorium-xyz-production.up.railway.app/info"
+                    class="policy-link"
+                >
+                    Kuralları ve politikaları incele →
+                </a>
+
+            </div>
+
+
+            <div class="auth-switch">
+
+                {switch_text}
+
+                <a href="{switch_link}">
+                    {switch_label}
+                </a>
+
+            </div>
+
+        </section>
+
+    </main>
+    """
+
+    return render_page(
+        title,
+        content,
+        show_nav=True
+    )
+
+
+# =========================================================
+# 12. ROUTES
 # =========================================================
 
 @app.route("/")
@@ -1651,14 +1916,7 @@ def index():
     return redirect("/login")
 
 
-# =========================================================
-# 12. REGISTER
-# =========================================================
-
-@app.route(
-    "/register",
-    methods=["GET", "POST"]
-)
+@app.route("/register", methods=["GET", "POST"])
 def register():
 
     if get_current_user():
@@ -1681,15 +1939,21 @@ def register():
         if len(username) < 3:
 
             error = (
-                "Kullanıcı adı en az "
-                "3 karakter olmalı."
+                "Kullanıcı adı en az 3 karakter "
+                "olmalı."
+            )
+
+        elif len(username) > 30:
+
+            error = (
+                "Kullanıcı adı en fazla 30 karakter "
+                "olabilir."
             )
 
         elif len(password) < 6:
 
             error = (
-                "Şifre en az "
-                "6 karakter olmalı."
+                "Şifre en az 6 karakter olmalı."
             )
 
         else:
@@ -1704,9 +1968,10 @@ def register():
             if exists:
 
                 error = (
-                    "Bu kullanıcı adı "
-                    "zaten kullanılıyor."
+                    "Bu kullanıcı adı zaten alınmış."
                 )
+
+                conn.close()
 
             else:
 
@@ -1717,12 +1982,7 @@ def register():
 
                 conn.execute("""
                     INSERT INTO users
-                    (
-                        username,
-                        password_hash,
-                        api_key,
-                        created_at
-                    )
+                    (username, password_hash, api_key, created_at)
                     VALUES (?, ?, ?, ?)
                 """, (
                     username,
@@ -1736,122 +1996,20 @@ def register():
 
                 return redirect("/login")
 
-            conn.close()
-
-    error_html = ""
-
-    if error:
-
-        error_html = f"""
-        <div class="error">
-            {html.escape(error)}
-        </div>
-        """
-
-    content = f"""
-
-    <main class="auth-wrapper">
-
-        <section class="container">
-
-            <div class="auth-brand">
-                <div class="logo-icon">V</div>
-            </div>
-
-            <h1 class="auth-title">
-                Vantorium'a Katıl
-            </h1>
-
-            <p class="auth-subtitle">
-                Hesabını oluştur ve kendi Vantorium
-                API anahtarını hemen al.
-            </p>
-
-            {error_html}
-
-            <form method="POST">
-
-                <label>
-                    Kullanıcı Adı
-                </label>
-
-                <input
-                    type="text"
-                    name="username"
-                    required
-                    autocomplete="username"
-                    placeholder="kullanici_adi"
-                >
-
-                <label>
-                    Şifre
-                </label>
-
-                <input
-                    type="password"
-                    name="password"
-                    required
-                    autocomplete="new-password"
-                    placeholder="En az 6 karakter"
-                >
-
-                <button
-                    type="submit"
-                    class="btn"
-                >
-                    Hesap Oluştur
-                </button>
-
-            </form>
-
-            <div class="auth-links">
-                Zaten hesabın var mı?
-                <a href="/login">
-                    Giriş Yap
-                </a>
-            </div>
-
-            <div class="policy-box">
-
-                <div class="policy-box-title">
-                    Kurallar ve Politikalar
-                </div>
-
-                <div class="policy-box-text">
-                    Vantorium'u kullanmadan önce
-                    kullanım koşullarını ve politikaları
-                    inceleyebilirsin.
-                </div>
-
-                <a
-                    class="policy-link"
-                    href="https://api-vantorium-xyz-production.up.railway.app/info"
-                >
-                    Kurallar & Politikaları Gör
-                </a>
-
-            </div>
-
-        </section>
-
-    </main>
-
-    """
-
-    return render_page(
+    return auth_page(
         "Kayıt Ol",
-        content
+        "Vantorium'a Katıl",
+        "Kendi hesabını oluştur ve Vantorium API'ni kullanmaya başla.",
+        "/register",
+        "Hesap Oluştur",
+        "Zaten hesabın var mı?",
+        "/login",
+        "Giriş Yap",
+        error
     )
 
 
-# =========================================================
-# 13. LOGIN
-# =========================================================
-
-@app.route(
-    "/login",
-    methods=["GET", "POST"]
-)
+@app.route("/login", methods=["GET", "POST"])
 def login():
 
     if get_current_user():
@@ -1903,128 +2061,29 @@ def login():
                 "session_token",
                 token,
                 httponly=True,
-                max_age=30 * 24 * 3600,
+                secure=request.is_secure,
                 samesite="Lax",
-                secure=request.is_secure
+                max_age=30 * 24 * 3600
             )
 
             return response
 
-        error = (
-            "Kullanıcı adı veya şifre hatalı."
-        )
+        error = "Kullanıcı adı veya şifre hatalı."
 
         conn.close()
 
-    error_html = ""
-
-    if error:
-
-        error_html = f"""
-        <div class="error">
-            {html.escape(error)}
-        </div>
-        """
-
-    content = f"""
-
-    <main class="auth-wrapper">
-
-        <section class="container">
-
-            <div class="auth-brand">
-                <div class="logo-icon">V</div>
-            </div>
-
-            <h1 class="auth-title">
-                Tekrar Hoş Geldin
-            </h1>
-
-            <p class="auth-subtitle">
-                Vantorium hesabına giriş yap ve
-                sistemlerine devam et.
-            </p>
-
-            {error_html}
-
-            <form method="POST">
-
-                <label>
-                    Kullanıcı Adı
-                </label>
-
-                <input
-                    type="text"
-                    name="username"
-                    required
-                    autocomplete="username"
-                    placeholder="kullanici_adi"
-                >
-
-                <label>
-                    Şifre
-                </label>
-
-                <input
-                    type="password"
-                    name="password"
-                    required
-                    autocomplete="current-password"
-                    placeholder="••••••••"
-                >
-
-                <button
-                    type="submit"
-                    class="btn"
-                >
-                    Giriş Yap
-                </button>
-
-            </form>
-
-            <div class="auth-links">
-                Hesabın yok mu?
-                <a href="/register">
-                    Kayıt Ol
-                </a>
-            </div>
-
-            <div class="policy-box">
-
-                <div class="policy-box-title">
-                    Kurallar ve Politikalar
-                </div>
-
-                <div class="policy-box-text">
-                    Hizmeti kullanmadan önce
-                    kurallarımızı ve politikalarımızı
-                    inceleyebilirsin.
-                </div>
-
-                <a
-                    class="policy-link"
-                    href="https://api-vantorium-xyz-production.up.railway.app/info"
-                >
-                    Kurallar & Politikaları Gör
-                </a>
-
-            </div>
-
-        </section>
-
-    </main>
-
-    """
-
-    return render_page(
+    return auth_page(
+        "Giriş",
+        "Tekrar Hoş Geldin",
+        "Vantorium hesabına giriş yap ve yapay zekâ asistanını kullan.",
+        "/login",
         "Giriş Yap",
-        content
+        "Hesabın yok mu?",
+        "/register",
+        "Kayıt Ol",
+        error
     )
 
-
-# =========================================================
-# 14. LOGOUT
-# =========================================================
 
 @app.route("/logout")
 def logout():
@@ -2057,7 +2116,7 @@ def logout():
 
 
 # =========================================================
-# 15. DASHBOARD
+# 13. DASHBOARD
 # =========================================================
 
 @app.route("/dashboard")
@@ -2070,132 +2129,104 @@ def dashboard():
 
     example_url = (
         f"{base_url}/api-key="
-        f"{user['api_key']}?word=merhaba"
+        f"{user['api_key']}"
+        f"?word=merhaba"
     )
 
     content = f"""
 
-    <main class="container wide">
+    <main class="container">
 
-        <div class="page-header">
+        <h1 class="page-title">
+            Dashboard
+        </h1>
 
-            <h1 class="page-title">
-                Dashboard
-            </h1>
+        <p class="subtitle">
+            Hoş geldin,
+            <strong style="color:white">
+                {user['username']}
+            </strong>.
+            Vantorium hesabını buradan yönetebilirsin.
+        </p>
 
-            <p class="page-subtitle">
-                Hoş geldin,
-                <strong style="color:white;">
-                    {html.escape(user['username'])}
-                </strong>.
-                Vantorium hesabını buradan yönet.
-            </p>
-
-        </div>
-
-        <div class="grid">
-
-            <section class="card">
-
-                <h3>
-                    🔑 API Anahtarın
-                </h3>
-
-                <div class="api-key-box">
-                    {html.escape(user['api_key'])}
-                </div>
-
-                <p>
-                    API anahtarını gizli tut.
-                    Sızdırılması durumunda yenileyebilirsin.
-                </p>
-
-                <form
-                    method="POST"
-                    action="/regenerate-key"
-                    style="margin-top:15px;"
-                >
-
-                    <button
-                        type="submit"
-                        class="btn danger btn-small"
-                    >
-                        Anahtarı Yenile
-                    </button>
-
-                </form>
-
-            </section>
-
-            <section class="card">
-
-                <h3>
-                    ⚡ API Durumu
-                </h3>
-
-                <p style="color:#54e3b5;">
-                    ● Sistem aktif
-                </p>
-
-                <p style="margin-top:8px;">
-                    Vantorium API motoru
-                    istekleri işlemeye hazır.
-                </p>
-
-            </section>
-
-        </div>
 
         <section class="card">
 
             <h3>
-                🚀 API Kullanımı
+                API Anahtarın
             </h3>
 
-            <p>
-                HTTP GET isteği göndererek
-                Vantorium motorunu kullanabilirsin.
-            </p>
-
-            <div class="code-block">
-                {html.escape(example_url)}
+            <div class="api-key-box">
+                {user['api_key']}
             </div>
 
             <p>
-                JSON yanıtında
-                <code style="color:#51dfb1;">
-                    answer
-                </code>
-                alanı asistanın cevabını içerir.
+                API anahtarını kimseyle paylaşma.
+                Gerekirse aşağıdaki butondan yenileyebilirsin.
+            </p>
+
+            <form
+                method="POST"
+                action="/regenerate-key"
+            >
+
+                <button
+                    class="small-danger"
+                    type="submit"
+                >
+                    Anahtarı Yenile
+                </button>
+
+            </form>
+
+        </section>
+
+
+        <section class="card">
+
+            <h3>
+                API Kullanımı
+            </h3>
+
+            <p>
+                HTTP GET isteği göndererek Vantorium'u
+                uygulamalarında kullanabilirsin.
+            </p>
+
+            <div class="code-block">
+                {example_url}
+            </div>
+
+            <p style="margin-top:12px">
+                Yanıt JSON olarak döner.
             </p>
 
         </section>
 
+
         <section class="card">
 
             <h3>
-                🧠 Vantorium Motoru
+                Hızlı Başlangıç
             </h3>
 
-            <ul>
+            <p>
+                Sohbet ekranından Vantorium'a soru sorabilir,
+                sistemin gerektiğinde bilgi kaynağını
+                araştırmasını sağlayabilirsin.
+            </p>
 
-                <li>
-                    Kendi soru-cevap veri setini kullanır.
-                </li>
-
-                <li>
-                    Daha önce öğrenilen cevapları hafızasında tutabilir.
-                </li>
-
-                <li>
-                    Google ve Wikipedia üzerinden araştırma yapabilir.
-                </li>
-
-                <li>
-                    Kod sorularında GitHub sonuçlarını kullanabilir.
-                </li>
-
-            </ul>
+            <a
+                href="/chat"
+                class="main-btn"
+                style="
+                    display:flex;
+                    justify-content:center;
+                    margin-top:15px;
+                "
+            >
+                Sohbete Başla
+            </a>
 
         </section>
 
@@ -2211,7 +2242,7 @@ def dashboard():
 
 
 # =========================================================
-# 16. CHAT
+# 14. CHAT
 # =========================================================
 
 @app.route("/chat")
@@ -2222,74 +2253,74 @@ def chat():
 
     content = """
 
-    <main class="chat-page">
+    <main class="chat-shell">
 
-        <div class="chat-layout">
+        <div
+            class="chat-history"
+            id="chatHistory"
+        >
 
-            <div
-                class="chat-history"
-                id="chatHistory"
-            >
+            <div class="chat-msg ai">
 
-                <div class="chat-msg ai">
+                <div class="avatar">
+                    V
+                </div>
 
-                    <div class="avatar">
-                        V
-                    </div>
-
-                    <div class="msg-content">
-                        Merhaba! Ben Vantorium.
-                        Sorunu yaz, birlikte bakalım.
-                    </div>
-
+                <div class="msg-content">
+                    Selam! Ben Vantorium. Hazırım.
+                    Bir şey sor, gerektiğinde araştırıp
+                    en uygun cevabı hazırlayayım.
                 </div>
 
             </div>
 
-            <div class="chat-input-area">
+        </div>
 
-                <div class="chat-input-box">
 
-                    <input
-                        type="text"
-                        id="chatInput"
-                        placeholder="Vantorium'a bir şey sor..."
-                        autocomplete="off"
+        <div class="chat-composer">
+
+            <div class="composer-box">
+
+                <input
+                    id="chatInput"
+                    type="text"
+                    placeholder="Vantorium'a bir şey sor..."
+                    autocomplete="off"
+                    maxlength="2000"
+                >
+
+                <button
+                    id="sendBtn"
+                    class="send-btn"
+                    type="button"
+                    onclick="sendChat()"
+                    aria-label="Gönder"
+                >
+
+                    <svg
+                        width="17"
+                        height="17"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2.5"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
                     >
+                        <line
+                            x1="12"
+                            y1="19"
+                            x2="12"
+                            y2="5"
+                        ></line>
 
-                    <button
-                        id="sendBtn"
-                        onclick="sendChat()"
-                        aria-label="Gönder"
-                    >
+                        <polyline
+                            points="5 12 12 5 19 12"
+                        ></polyline>
 
-                        <svg
-                            width="17"
-                            height="17"
-                            viewBox="0 0 24 24"
-                            fill="none"
-                            stroke="currentColor"
-                            stroke-width="2.4"
-                            stroke-linecap="round"
-                            stroke-linejoin="round"
-                        >
+                    </svg>
 
-                            <line
-                                x1="12"
-                                y1="19"
-                                x2="12"
-                                y2="5"
-                            ></line>
-
-                            <polyline
-                                points="5 12 12 5 19 12"
-                            ></polyline>
-
-                        </svg>
-
-                    </button>
-
-                </div>
+                </button>
 
             </div>
 
@@ -2297,47 +2328,38 @@ def chat():
 
     </main>
 
+
     <script>
 
-    const chatHistory =
+    const historyBox =
         document.getElementById("chatHistory");
 
-    const chatInput =
+    const input =
         document.getElementById("chatInput");
 
-    const sendBtn =
+    const sendButton =
         document.getElementById("sendBtn");
 
-
-    chatInput.focus();
-
-
-    chatInput.addEventListener(
-        "keydown",
-        function(event) {
-
-            if (
-                event.key === "Enter"
-                && !event.shiftKey
-            ) {
-
-                event.preventDefault();
-
-                sendChat();
-
-            }
-
-        }
-    );
+    let busy = false;
 
 
-    function addMsg(text, sender) {
+    function scrollBottom() {
+
+        historyBox.scrollTo({
+            top: historyBox.scrollHeight,
+            behavior: "smooth"
+        });
+
+    }
+
+
+    function addMessage(text, type) {
 
         const wrapper =
             document.createElement("div");
 
         wrapper.className =
-            "chat-msg " + sender;
+            "chat-msg " + type;
 
 
         const avatar =
@@ -2347,9 +2369,7 @@ def chat():
             "avatar";
 
         avatar.textContent =
-            sender === "user"
-                ? "K"
-                : "V";
+            type === "user" ? "K" : "V";
 
 
         const message =
@@ -2358,50 +2378,114 @@ def chat():
         message.className =
             "msg-content";
 
+        // Güvenli:
+        // innerHTML yerine textContent.
         message.textContent =
             text;
 
 
         wrapper.appendChild(avatar);
-
         wrapper.appendChild(message);
 
-        chatHistory.appendChild(wrapper);
+        historyBox.appendChild(wrapper);
 
-        chatHistory.scrollTop =
-            chatHistory.scrollHeight;
-
+        scrollBottom();
 
         return message;
+    }
+
+
+    function createThinkingMessage() {
+
+        const wrapper =
+            document.createElement("div");
+
+        wrapper.className =
+            "chat-msg ai";
+
+
+        const avatar =
+            document.createElement("div");
+
+        avatar.className =
+            "avatar";
+
+        avatar.textContent =
+            "V";
+
+
+        const content =
+            document.createElement("div");
+
+        content.className =
+            "msg-content";
+
+
+        content.innerHTML = `
+            <div class="thinking-box">
+
+                <div class="thinking-main">
+                    Düşünüyor...
+                </div>
+
+                <div class="thinking-status">
+
+                    <span class="loader"></span>
+
+                    <span id="thinkingStatus">
+                        Sorunu analiz ediyor...
+                    </span>
+
+                </div>
+
+            </div>
+        `;
+
+
+        wrapper.appendChild(avatar);
+        wrapper.appendChild(content);
+
+        historyBox.appendChild(wrapper);
+
+        scrollBottom();
+
+        return {
+            wrapper,
+            content
+        };
 
     }
 
 
     async function sendChat() {
 
+        if (busy)
+            return;
+
+
         const text =
-            chatInput.value.trim();
+            input.value.trim();
+
 
         if (!text)
             return;
 
 
-        chatInput.value = "";
+        busy = true;
 
-        sendBtn.disabled = true;
+        sendButton.disabled = true;
+
+        input.value = "";
 
 
-        addMsg(
+        addMessage(
             text,
             "user"
         );
 
 
-        const aiMessage =
-            addMsg(
-                "Düşünüyor...",
-                "ai"
-            );
+        const thinking =
+            createThinkingMessage();
 
 
         try {
@@ -2425,7 +2509,11 @@ def chat():
 
 
             if (!response.ok) {
-                throw new Error();
+
+                throw new Error(
+                    "Server error"
+                );
+
             }
 
 
@@ -2435,46 +2523,187 @@ def chat():
             const decoder =
                 new TextDecoder();
 
-            aiMessage.textContent = "";
+
+            let buffer = "";
+
+            let answerStarted = false;
+
+            let answerElement = null;
 
 
             while (true) {
 
-                const {
-                    done,
-                    value
-                } = await reader.read();
+                const result =
+                    await reader.read();
 
 
-                if (done)
+                if (result.done)
                     break;
 
 
-                aiMessage.textContent +=
+                buffer +=
                     decoder.decode(
-                        value,
-                        {stream:true}
+                        result.value,
+                        {
+                            stream: true
+                        }
                     );
 
 
-                chatHistory.scrollTop =
-                    chatHistory.scrollHeight;
+                const lines =
+                    buffer.split("\\n");
+
+                buffer =
+                    lines.pop();
+
+
+                for (const line of lines) {
+
+                    if (!line.trim())
+                        continue;
+
+
+                    try {
+
+                        const event =
+                            JSON.parse(line);
+
+
+                        if (event.type === "status") {
+
+                            const status =
+                                thinking.content
+                                    .querySelector(
+                                        "#thinkingStatus"
+                                    );
+
+                            const main =
+                                thinking.content
+                                    .querySelector(
+                                        ".thinking-main"
+                                    );
+
+
+                            if (status)
+                                status.textContent =
+                                    event.message;
+
+
+                            if (main)
+                                main.textContent =
+                                    event.title || "Düşünüyor...";
+
+
+                            scrollBottom();
+
+                        }
+
+
+                        else if (
+                            event.type === "answer"
+                        ) {
+
+                            if (!answerStarted) {
+
+                                thinking.wrapper.remove();
+
+                                answerElement =
+                                    addMessage(
+                                        "",
+                                        "ai"
+                                    );
+
+                                answerStarted = true;
+
+                            }
+
+
+                            answerElement.textContent +=
+                                event.text;
+
+
+                            scrollBottom();
+
+                        }
+
+
+                        else if (
+                            event.type === "done"
+                        ) {
+
+                            scrollBottom();
+
+                        }
+
+
+                        else if (
+                            event.type === "error"
+                        ) {
+
+                            if (!answerStarted) {
+
+                                thinking.wrapper.remove();
+
+                                addMessage(
+                                    event.message ||
+                                    "Bir hata oluştu.",
+                                    "ai"
+                                );
+
+                            }
+
+                        }
+
+                    } catch (e) {
+                        // Bozuk stream parçasını atla.
+                    }
+
+                }
 
             }
 
-        } catch(error) {
 
-            aiMessage.textContent =
-                "Bağlantı hatası oluştu.";
+        } catch (error) {
+
+            thinking.wrapper.remove();
+
+            addMessage(
+                "Bağlantı sırasında bir hata oluştu. Lütfen tekrar dene.",
+                "ai"
+            );
 
         }
 
 
-        sendBtn.disabled = false;
+        busy = false;
 
-        chatInput.focus();
+        sendButton.disabled = false;
+
+        input.focus();
 
     }
+
+
+    input.addEventListener(
+        "keydown",
+        function(event) {
+
+            if (
+                event.key === "Enter"
+                && !event.shiftKey
+            ) {
+
+                event.preventDefault();
+
+                sendChat();
+
+            }
+
+        }
+    );
+
+
+    input.focus();
 
     </script>
 
@@ -2488,13 +2717,10 @@ def chat():
 
 
 # =========================================================
-# 17. CHAT API
+# 15. STREAMING CHAT API
 # =========================================================
 
-@app.route(
-    "/api/chat",
-    methods=["POST"]
-)
+@app.route("/api/chat", methods=["POST"])
 @login_required
 def api_chat():
 
@@ -2502,44 +2728,238 @@ def api_chat():
         silent=True
     ) or {}
 
-    kelime = str(
+    message = str(
         data.get("message", "")
     ).strip()
 
-    if not kelime:
 
-        return Response(
-            "Mesaj boş olamaz.",
-            mimetype="text/plain"
-        )
+    if not message:
 
-    if len(kelime) > 4000:
+        return jsonify({
+            "error": "Mesaj boş olamaz."
+        }), 400
 
-        return Response(
-            "Mesaj çok uzun.",
-            mimetype="text/plain"
-        ), 400
 
-    answer, source = get_answer(
-        kelime
-    )
+    if len(message) > 2000:
+
+        return jsonify({
+            "error": "Mesaj çok uzun."
+        }), 400
+
 
     def generate():
 
-        for char in answer:
+        try:
 
-            yield char
+            # 1
+            yield json.dumps({
+                "type": "status",
+                "title": "Düşünüyor...",
+                "message": "Sorunu analiz ediyor..."
+            }, ensure_ascii=False) + "\n"
 
-            time.sleep(0.008)
+            time.sleep(.25)
+
+
+            parts = analyze_query(
+                message
+            )
+
+
+            # Greeting / dataset / math
+            local_answer = None
+            local_source = None
+
+
+            if parts["is_greeting"]:
+
+                local_answer = random.choice([
+                    "Selam! Ben Vantorium. Hazırım, ne hakkında konuşalım?",
+                    "Merhaba! Vantorium hazır. Ne öğrenmek istersin?",
+                    "Selam kral! Sorunu gönder, birlikte bakalım."
+                ])
+
+                local_source = "selamlama"
+
+
+            elif parts["is_math"]:
+
+                try:
+
+                    result = safe_math(message)
+
+                    if (
+                        isinstance(result, float)
+                        and result.is_integer()
+                    ):
+                        result = int(result)
+
+                    local_answer = (
+                        f"Sonuç: {result}"
+                    )
+
+                    local_source = "matematik"
+
+                except Exception:
+
+                    local_answer = (
+                        "Bu matematik ifadesini "
+                        "çözemedim."
+                    )
+
+                    local_source = "hata"
+
+
+            elif (
+                normalize(message) in DATASET
+                and DATASET[
+                    normalize(message)
+                ]
+            ):
+
+                local_answer = random.choice(
+                    DATASET[
+                        normalize(message)
+                    ]
+                )
+
+                local_source = "veri_seti"
+
+
+            else:
+
+                cached = memory_get(
+                    normalize(message)
+                )
+
+                if cached:
+
+                    local_answer = cached
+                    local_source = "hafiza"
+
+
+            if local_answer is not None:
+
+                yield json.dumps({
+                    "type": "status",
+                    "title": "Cevap hazırlanıyor...",
+                    "message": "Bildiklerimi kontrol ediyorum..."
+                }, ensure_ascii=False) + "\n"
+
+                time.sleep(.3)
+
+
+            else:
+
+                # 2
+                yield json.dumps({
+                    "type": "status",
+                    "title": "Web'de arıyor...",
+                    "message": (
+                        "Uygun bilgi kaynaklarını "
+                        "araştırıyorum..."
+                    )
+                }, ensure_ascii=False) + "\n"
+
+                time.sleep(.35)
+
+
+                results = search_web(
+                    message,
+                    parts
+                )
+
+
+                # 3
+                yield json.dumps({
+                    "type": "status",
+                    "title": "Bulduğu bilgileri inceliyor...",
+                    "message": (
+                        f"{len(results)} kaynak "
+                        "değerlendiriliyor..."
+                    )
+                }, ensure_ascii=False) + "\n"
+
+                time.sleep(.35)
+
+
+                local_answer = build_normal_answer(
+                    message,
+                    results
+                )
+
+
+                local_source = (
+                    results[0].get(
+                        "source",
+                        "web"
+                    )
+                    if results
+                    else "bulunamadi"
+                )
+
+
+                if results:
+
+                    memory_save(
+                        normalize(message),
+                        local_answer,
+                        .85,
+                        local_source
+                    )
+
+
+            # 4
+            yield json.dumps({
+                "type": "status",
+                "title": "En uygun cevabı hazırlıyor...",
+                "message": "Bilgileri sade ve anlaşılır hale getiriyorum..."
+            }, ensure_ascii=False) + "\n"
+
+            time.sleep(.3)
+
+
+            # Answer stream
+            for char in local_answer:
+
+                yield json.dumps({
+                    "type": "answer",
+                    "text": char
+                }, ensure_ascii=False) + "\n"
+
+                # hızlı ama akıcı
+                time.sleep(.006)
+
+
+            yield json.dumps({
+                "type": "done",
+                "source": local_source
+            }, ensure_ascii=False) + "\n"
+
+
+        except Exception as error:
+
+            yield json.dumps({
+                "type": "error",
+                "message": (
+                    "Cevap oluşturulurken "
+                    "bir hata oluştu."
+                )
+            }, ensure_ascii=False) + "\n"
+
 
     return Response(
         generate(),
-        mimetype="text/plain; charset=utf-8"
+        mimetype="application/x-ndjson",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no"
+        }
     )
 
 
 # =========================================================
-# 18. REGENERATE API KEY
+# 16. API KEY REGENERATE
 # =========================================================
 
 @app.route(
@@ -2570,7 +2990,7 @@ def regenerate_key():
 
 
 # =========================================================
-# 19. INFO / RULES
+# 17. INFO
 # =========================================================
 
 @app.route("/info")
@@ -2582,100 +3002,80 @@ def info():
 
     content = f"""
 
-    <main class="container wide">
+    <main class="container">
 
-        <div class="page-header">
+        <h1 class="page-title">
+            Bilgi Merkezi
+        </h1>
 
-            <h1 class="page-title">
-                Bilgi Merkezi
-            </h1>
-
-            <p class="page-subtitle">
-                Vantorium API ve kullanım politikaları.
-            </p>
-
-        </div>
+        <p class="subtitle">
+            Vantorium'u kullanmadan önce bilmen gerekenler.
+        </p>
 
 
-        <section class="card">
+        <section class="info-card">
 
-            <h3>
-                🤖 Vantorium Nedir?
-            </h3>
+            <h2>
+                Vantorium Nedir?
+            </h2>
 
             <p>
-                Vantorium; soru-cevap veri tabanı,
-                hafıza sistemi ve web araştırma
-                özelliklerini bir araya getiren
+                Vantorium, soruları analiz eden,
+                gerektiğinde bilgi kaynaklarını araştıran
+                ve bulunan bilgileri kullanıcıya daha
+                anlaşılır şekilde sunmayı amaçlayan
                 yapay zekâ asistanıdır.
             </p>
 
         </section>
 
 
-        <h2 class="section-title">
-            API Kullanımı
-        </h2>
+        <section class="info-card">
 
-        <section class="card">
+            <h2>
+                API Kullanımı
+            </h2>
 
             <p>
-                API anahtarın hesabına özel olarak
-                oluşturulur.
+                API anahtarını kullanarak şu şekilde
+                istek gönderebilirsin:
             </p>
 
             <div class="code-block">
-                {html.escape(base_url)}
-                /api-key=SENIN_ANAHTARIN?word=merhaba
-            </div>
-
-            <p>
-                Örnek:
-            </p>
-
-            <div class="code-block">
-                {html.escape(base_url)}
-                /api-key=vnt_ornekanahtar123?word=merhaba
+                {base_url}/api-key=SENIN_API_KEY?word=merhaba
             </div>
 
         </section>
 
 
-        <h2 class="section-title">
-            Kurallar ve Koşullar
-        </h2>
+        <section class="info-card">
 
-        <section class="card">
+            <h2>
+                Kurallar
+            </h2>
 
             <ul>
 
                 <li>
-                    API anahtarını üçüncü kişilerle paylaşma.
+                    API anahtarını başkalarıyla paylaşma.
                 </li>
 
                 <li>
-                    Sisteme zarar verecek saldırılar
-                    gerçekleştirme.
+                    Sistemi aşırı isteklerle yavaşlatmaya
+                    veya hizmet dışı bırakmaya çalışma.
                 </li>
 
                 <li>
-                    DDoS, SQL Injection ve XSS gibi
-                    kötüye kullanım yasaktır.
+                    Yasa dışı amaçlarla kullanma.
                 </li>
 
                 <li>
-                    Yasa dışı faaliyetlerde kullanma.
+                    Vantorium'un verdiği bilgileri kritik
+                    konularda ayrıca doğrula.
                 </li>
 
                 <li>
-                    Aşırı otomatik isteklerle sistemi
-                    yorma.
-                </li>
-
-                <li>
-                    Vantorium tarafından verilen
-                    bilgileri kritik kararlar öncesinde
-                    doğrula.
+                    Sistemin açıklarını kötüye kullanma.
                 </li>
 
             </ul>
@@ -2683,55 +3083,41 @@ def info():
         </section>
 
 
-        <h2 class="section-title">
-            Gizlilik
-        </h2>
+        <section class="info-card">
 
-        <section class="card">
+            <h2>
+                Gizlilik
+            </h2>
 
             <p>
-                Hesap işlemleri için kullanıcı adı,
-                parola özeti ve API anahtarı tutulur.
-                Sistem performansını geliştirmek amacıyla
-                bazı teknik veriler saklanabilir.
+                Hesap sistemi kullanıcı adı, parola özeti
+                ve API anahtarı gibi hesap verilerini
+                yönetmek için SQLite kullanır.
+                Sohbet cevapları gerektiğinde sistemin
+                hafıza mekanizmasında saklanabilir.
             </p>
 
         </section>
 
 
-        <h2 class="section-title">
-            Hizmet Kullanımı
-        </h2>
+        <section class="info-card">
 
-        <section class="card">
-
-            <p>
-                Vantorium hizmeti geliştirilebilir,
-                güncellenebilir veya bakım nedeniyle
-                geçici olarak kullanılamayabilir.
-            </p>
-
-        </section>
-
-
-        <h2 class="section-title">
-            Yasal Uyarı
-        </h2>
-
-        <section class="card">
+            <h2>
+                Sorumluluk Reddi
+            </h2>
 
             <p>
-                Vantorium tarafından oluşturulan
-                cevaplar bilgilendirme amaçlıdır.
-                Tıbbi, hukuki veya finansal profesyonel
-                tavsiye yerine geçmez.
+                Vantorium tarafından verilen cevaplar
+                bilgilendirme amaçlıdır. Özellikle tıbbi,
+                hukuki ve finansal konularda profesyonel
+                doğrulama yapılmalıdır.
             </p>
 
         </section>
 
 
         <div class="footer">
-            © 2026 Vantorium AI · Tüm hakları saklıdır.
+            © 2026 Vantorium AI
         </div>
 
     </main>
@@ -2739,14 +3125,14 @@ def info():
     """
 
     return render_page(
-        "Bilgi Merkezi",
+        "Bilgi",
         content,
         user
     )
 
 
 # =========================================================
-# 20. EXTERNAL API
+# 18. EXTERNAL API
 # =========================================================
 
 @app.route(
@@ -2760,14 +3146,12 @@ def api_word(apikey):
         ""
     ).strip()
 
+
     if not word:
 
         return jsonify({
-            "error":
-                "word parametresi gerekli",
-
-            "usage":
-                "/api-key=...?word=kelime"
+            "error": "word parametresi gerekli",
+            "usage": "/api-key=...?word=kelime"
         }), 400
 
 
@@ -2784,12 +3168,12 @@ def api_word(apikey):
     if not user:
 
         return jsonify({
-            "error":
-                "Geçersiz API anahtarı"
+            "error": "Geçersiz API anahtarı"
         }), 401
 
 
     start = time.time()
+
 
     answer, source = get_answer(
         word
@@ -2806,27 +3190,25 @@ def api_word(apikey):
 
             "source": source,
 
-            "time_ms":
-                round(
-                    (time.time() - start)
-                    * 1000,
-                    2
-                ),
+            "time_ms": round(
+                (time.time() - start) * 1000,
+                2
+            ),
 
-            "engine":
-                "Vantorium v4.1",
+            "engine": "Vantorium v5",
 
             "timestamp":
                 datetime.now()
                 .astimezone()
                 .isoformat()
+
         }
 
     })
 
 
 # =========================================================
-# 21. RUN
+# 19. RUN
 # =========================================================
 
 if __name__ == "__main__":
@@ -2840,5 +3222,6 @@ if __name__ == "__main__":
 
     app.run(
         host="0.0.0.0",
-        port=port
+        port=port,
+        threaded=True
     )
