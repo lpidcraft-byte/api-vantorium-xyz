@@ -8,27 +8,44 @@ import urllib.parse
 import time
 import secrets
 import hashlib
-import ast
-import operator
+import html
 from datetime import datetime
 from functools import wraps
 from flask import (
-    Flask,
-    request,
-    jsonify,
-    Response,
-    redirect,
+    Flask, request, jsonify, Response,
+    render_template_string, redirect,
     make_response
 )
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
 
+# ============================================================
+# 1. AYARLAR
+# ============================================================
+
 DB_FILE = "vantorium.db"
 
-# =========================================================
-# 1. DATABASE
-# =========================================================
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+
+    "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
+
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+]
+
+COMMON_HEADERS = {
+    "User-Agent": random.choice(USER_AGENTS),
+    "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7"
+}
+
+
+# ============================================================
+# 2. VERİ TABANI
+# ============================================================
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -79,19 +96,14 @@ def hash_password(password):
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
 
 
-def normalize(text):
-    text = str(text).lower().strip()
-    text = re.sub(r"\s+", " ", text)
-    text = re.sub(r"[?!.,;:]+$", "", text)
-    return text.strip()
-
-
 def memory_get(word):
     conn = db()
+
     row = conn.execute(
         "SELECT answer FROM memory WHERE word = ?",
         (word,)
     ).fetchone()
+
     conn.close()
 
     return row["answer"] if row else None
@@ -116,9 +128,16 @@ def memory_save(word, answer, confidence, source):
     conn.close()
 
 
-# =========================================================
-# 2. DATASET
-# =========================================================
+# ============================================================
+# 3. DATASET
+# ============================================================
+
+def normalize(text):
+    text = str(text or "").lower().strip()
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"[?!.,;:]+$", "", text)
+    return text.strip()
+
 
 def load_dataset():
     files = [
@@ -136,7 +155,7 @@ def load_dataset():
 
         try:
             with open(filename, "r", encoding="utf-8") as file:
-                current_question = None
+                current_q = None
 
                 for line in file:
                     line = line.strip()
@@ -145,18 +164,20 @@ def load_dataset():
                         continue
 
                     if line.startswith("Input:"):
-                        current_question = normalize(
+                        current_q = normalize(
                             line.replace("Input:", "", 1).strip()
                         )
 
-                        if current_question not in data:
-                            data[current_question] = []
+                        if current_q not in data:
+                            data[current_q] = []
 
-                    elif line.startswith("Reply:") and current_question:
-                        answer = line.replace("Reply:", "", 1).strip()
+                    elif line.startswith("Reply:") and current_q:
+                        reply = line.replace(
+                            "Reply:", "", 1
+                        ).strip()
 
-                        if answer:
-                            data[current_question].append(answer)
+                        if reply:
+                            data[current_q].append(reply)
 
             break
 
@@ -169,210 +190,220 @@ def load_dataset():
 DATASET = load_dataset()
 
 
-# =========================================================
-# 3. QUERY ANALYSIS
-# =========================================================
+# ============================================================
+# 4. SORU ANALİZİ
+# ============================================================
 
 def analyze_query(query):
     q = normalize(query)
 
-    code_words = [
-        "kod",
-        "python",
-        "javascript",
-        "js",
-        "node",
-        "php",
-        "flask",
-        "html",
-        "css",
-        "api",
-        "github",
-        "programlama",
-        "yazılım",
-        "function",
-        "class",
-        "bug",
-        "hata",
-        "error",
-        "debug",
-        "sql",
-        "database",
-        "veritabanı",
-        "react",
-        "discord bot",
-        "telegram bot"
-    ]
-
-    greeting_words = [
-        "merhaba",
-        "selam",
-        "hello",
-        "hi",
-        "hey",
-        "günaydın",
-        "iyi akşamlar",
-        "iyi geceler",
-        "nasılsın",
-        "naber",
-        "nbr"
-    ]
+    is_greeting = bool(re.search(
+        r"\b(merhaba|selam|hello|hi|hey|günaydın|"
+        r"nasılsın|naber|nbr|sa|selamünaleyküm)\b",
+        q
+    ))
 
     is_math = bool(
-        re.fullmatch(
-            r"[0-9\s\+\-\*\/\(\)\.\,\^%]+",
-            query
-        )
+        re.match(r"^[\d\s+\-*/().,^%]+$", query)
         and re.search(r"[\+\-\*\/\^%]", query)
     )
 
+    is_code = bool(re.search(
+        r"\b(kod|python|php|javascript|js|java|"
+        r"html|css|flask|api|github|programlama|"
+        r"fonksiyon|function|class|bug|hata|error|"
+        r"debug|discord bot|telegram bot)\b",
+        q
+    ))
+
+    # "X ne demek?"
+    definition_patterns = [
+        r"^(.+?)\s+ne demek$",
+        r"^(.+?)\s+nedir$",
+        r"^(.+?)\s+ne anlama geliyor$",
+        r"^(.+?)\s+anlamı ne$",
+        r"^(.+?)\s+anlamı nedir$"
+    ]
+
+    definition_word = None
+
+    for pattern in definition_patterns:
+        match = re.match(pattern, q)
+        if match:
+            definition_word = match.group(1).strip()
+            break
+
+    # "Bana X dedi, ne diyeyim?"
+    reply_patterns = [
+        r"(?:biri|birisi|arkadaşım|o) bana (.+?) dedi.*ne (?:diyeyim|demeliyim|denir|cevap vereyim)",
+        r"(.+?) derse ne (?:diyeyim|demeliyim|denir|cevap vereyim)",
+        r"(.+?) dedi.*ne (?:diyeyim|demeliyim|denir|cevap vereyim)",
+        r"(.+?) diyene ne (?:diyeyim|demeliyim|denir)"
+    ]
+
+    reply_word = None
+
+    for pattern in reply_patterns:
+        match = re.search(pattern, q)
+        if match:
+            reply_word = match.group(1).strip()
+            break
+
+    image_request = bool(re.search(
+        r"\b(resim|fotoğraf|foto|görsel|görüntü|"
+        r"image|images|picture|fotoğrafları)\b",
+        q
+    ))
+
     return {
-        "is_greeting": any(
-            re.search(r"\b" + re.escape(word) + r"\b", q)
-            for word in greeting_words
-        ),
+        "is_greeting": is_greeting,
         "is_math": is_math,
-        "is_code": any(word in q for word in code_words),
-        "query": q
+        "is_code": is_code,
+        "definition_word": definition_word,
+        "reply_word": reply_word,
+        "image_request": image_request
     }
 
 
-# =========================================================
-# 4. SAFE MATH
-# =========================================================
+# ============================================================
+# 5. MATEMATİK
+# ============================================================
 
-ALLOWED_OPERATORS = {
-    ast.Add: operator.add,
-    ast.Sub: operator.sub,
-    ast.Mult: operator.mul,
-    ast.Div: operator.truediv,
-    ast.Mod: operator.mod,
-    ast.Pow: operator.pow,
-    ast.USub: operator.neg,
-    ast.UAdd: operator.pos
-}
+def calculate_math(query):
+    try:
+        expression = query.replace("^", "**")
 
+        # Sadece güvenli matematik karakterleri
+        expression = re.sub(
+            r"[^0-9+\-*/().% ]",
+            "",
+            expression
+        )
 
-def safe_math(expression):
-    expression = expression.replace(",", ".")
-    expression = expression.replace("^", "**")
+        result = eval(
+            expression,
+            {
+                "__builtins__": {}
+            },
+            {}
+        )
 
-    if len(expression) > 100:
-        raise ValueError("Expression too long")
+        return f"Sonuç: {result}"
 
-    tree = ast.parse(expression, mode="eval")
-
-    def calculate(node):
-        if isinstance(node, ast.Expression):
-            return calculate(node.body)
-
-        if isinstance(node, ast.Constant):
-            if isinstance(node.value, (int, float)):
-                if abs(node.value) > 10**12:
-                    raise ValueError("Number too large")
-                return node.value
-
-        if isinstance(node, ast.BinOp):
-            left = calculate(node.left)
-            right = calculate(node.right)
-
-            operation = ALLOWED_OPERATORS.get(type(node.op))
-
-            if operation is None:
-                raise ValueError("Operator not allowed")
-
-            if isinstance(node.op, ast.Pow) and abs(right) > 20:
-                raise ValueError("Exponent too large")
-
-            result = operation(left, right)
-
-            if abs(result) > 10**15:
-                raise ValueError("Result too large")
-
-            return result
-
-        if isinstance(node, ast.UnaryOp):
-            operation = ALLOWED_OPERATORS.get(type(node.op))
-
-            if operation is None:
-                raise ValueError("Operator not allowed")
-
-            return operation(calculate(node.operand))
-
-        raise ValueError("Invalid expression")
-
-    return calculate(tree)
+    except Exception:
+        return "Bu matematik işlemini çözemedim."
 
 
-# =========================================================
-# 5. WEB SEARCH
-# =========================================================
+# ============================================================
+# 6. DUCKDUCKGO WEB ARAMA
+# ============================================================
 
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
-    "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/131.0 Mobile Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/131.0 Safari/537.36"
-]
-
-
-def create_session():
-    session = requests.Session()
-
-    session.headers.update({
-        "User-Agent": random.choice(USER_AGENTS),
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7"
-    })
-
-    return session
-
-
-def github_search(query):
-    """
-    Public GitHub repository search.
-    Token zorunlu değildir.
-
-    Kod/yazılım sorularında GitHub kullanılır.
-    """
-
+def duckduckgo_search(query, limit=6):
     results = []
 
     try:
-        session = create_session()
+        encoded = urllib.parse.quote_plus(query)
 
-        params = {
-            "q": query,
-            "sort": "stars",
-            "order": "desc",
-            "per_page": 5
+        url = (
+            "https://html.duckduckgo.com/html/"
+            f"?q={encoded}"
+        )
+
+        headers = {
+            **COMMON_HEADERS,
+            "Accept": "text/html,application/xhtml+xml"
         }
 
-        response = session.get(
-            "https://api.github.com/search/repositories",
-            params=params,
-            headers={
-                "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": "2026-03-10"
-            },
+        response = requests.get(
+            url,
+            headers=headers,
             timeout=8
         )
 
         if response.status_code != 200:
             return results
 
-        data = response.json()
+        page = response.text
 
-        for item in data.get("items", [])[:5]:
-            description = item.get("description") or ""
+        blocks = re.findall(
+            r'<div class="result[^"]*".*?</div>\s*</div>',
+            page,
+            re.DOTALL
+        )
 
-            results.append({
-                "title": item.get("full_name", ""),
-                "description": description,
-                "url": item.get("html_url", ""),
-                "stars": item.get("stargazers_count", 0),
-                "language": item.get("language") or "",
-                "source": "github"
-            })
+        for block in blocks[:limit]:
+            title_match = re.search(
+                r'class="result__a"[^>]*>(.*?)</a>',
+                block,
+                re.DOTALL
+            )
+
+            snippet_match = re.search(
+                r'class="result__snippet"[^>]*>(.*?)</a>|'
+                r'class="result__snippet"[^>]*>(.*?)</div>',
+                block,
+                re.DOTALL
+            )
+
+            url_match = re.search(
+                r'class="result__a"\s+href="([^"]+)"',
+                block
+            )
+
+            if not title_match:
+                continue
+
+            title = re.sub(
+                r"<[^>]+>",
+                "",
+                title_match.group(1)
+            )
+
+            title = html.unescape(title).strip()
+
+            snippet = ""
+
+            if snippet_match:
+                snippet = (
+                    snippet_match.group(1)
+                    or snippet_match.group(2)
+                    or ""
+                )
+
+                snippet = re.sub(
+                    r"<[^>]+>",
+                    "",
+                    snippet
+                )
+
+                snippet = html.unescape(
+                    snippet
+                ).strip()
+
+            result_url = ""
+
+            if url_match:
+                result_url = html.unescape(
+                    url_match.group(1)
+                )
+
+                # DDG redirect linklerini çöz
+                if "uddg=" in result_url:
+                    parsed = urllib.parse.urlparse(result_url)
+                    params = urllib.parse.parse_qs(
+                        parsed.query
+                    )
+
+                    if "uddg" in params:
+                        result_url = params["uddg"][0]
+
+            if title:
+                results.append({
+                    "title": title,
+                    "snippet": snippet,
+                    "url": result_url,
+                    "source": "web"
+                })
 
     except Exception:
         pass
@@ -380,11 +411,15 @@ def github_search(query):
     return results
 
 
-def wikipedia_search(query):
+# ============================================================
+# 7. WIKIPEDIA
+# ============================================================
+
+def wikipedia_search(query, limit=4):
     results = []
 
     try:
-        session = create_session()
+        url = "https://tr.wikipedia.org/w/api.php"
 
         params = {
             "action": "query",
@@ -392,36 +427,40 @@ def wikipedia_search(query):
             "srsearch": query,
             "utf8": 1,
             "format": "json",
-            "srlimit": 5
+            "srlimit": limit
         }
 
-        response = session.get(
-            "https://tr.wikipedia.org/w/api.php",
+        response = requests.get(
+            url,
             params=params,
+            headers=COMMON_HEADERS,
             timeout=8
         )
 
-        if response.status_code != 200:
-            return results
-
         data = response.json()
 
-        for item in data.get("query", {}).get("search", [])[:5]:
+        for item in data.get("query", {}).get("search", []):
             title = item.get("title", "")
-            snippet = item.get("snippet", "")
 
-            snippet = re.sub(r"<[^>]+>", "", snippet)
-            snippet = re.sub(r"\s+", " ", snippet).strip()
+            snippet = re.sub(
+                r"<[^>]+>",
+                "",
+                item.get("snippet", "")
+            )
 
-            url = (
+            snippet = html.unescape(snippet)
+
+            wiki_url = (
                 "https://tr.wikipedia.org/wiki/"
-                + urllib.parse.quote(title.replace(" ", "_"))
+                + urllib.parse.quote(
+                    title.replace(" ", "_")
+                )
             )
 
             results.append({
                 "title": title,
-                "description": snippet,
-                "url": url,
+                "snippet": snippet,
+                "url": wiki_url,
                 "source": "wikipedia"
             })
 
@@ -431,224 +470,530 @@ def wikipedia_search(query):
     return results
 
 
-def search_web(query, parts):
-    """
-    Kod sorularında:
-        GitHub
+# ============================================================
+# 8. GITHUB ARAMA
+# ============================================================
 
-    Diğer sorularda:
-        Wikipedia
+def github_search(query, limit=5):
+    results = []
 
-    Böylece GitHub sonuçları normal sorulara gereksiz şekilde
-    karışmaz.
-    """
+    try:
+        url = "https://api.github.com/search/repositories"
 
-    if parts["is_code"]:
-        return github_search(query)
+        params = {
+            "q": query,
+            "sort": "stars",
+            "order": "desc",
+            "per_page": limit
+        }
 
-    return wikipedia_search(query)
+        headers = {
+            **COMMON_HEADERS,
+            "Accept": "application/vnd.github+json"
+        }
+
+        response = requests.get(
+            url,
+            params=params,
+            headers=headers,
+            timeout=8
+        )
+
+        if response.status_code != 200:
+            return results
+
+        data = response.json()
+
+        for item in data.get("items", []):
+            results.append({
+                "title": item.get("full_name", ""),
+                "snippet": item.get("description")
+                           or "Açıklama bulunamadı.",
+                "url": item.get("html_url", ""),
+                "source": "github",
+                "stars": item.get("stargazers_count", 0),
+                "language": item.get("language")
+                            or ""
+            })
+
+    except Exception:
+        pass
+
+    return results
 
 
-# =========================================================
-# 6. ANSWER BUILDER
-# =========================================================
+# ============================================================
+# 9. WIKIMEDIA GÖRSEL ARAMA
+# ============================================================
+
+def image_search(query, limit=6):
+    images = []
+
+    try:
+        url = "https://commons.wikimedia.org/w/api.php"
+
+        params = {
+            "action": "query",
+            "generator": "search",
+            "gsrsearch": query,
+            "gsrnamespace": 6,
+            "gsrlimit": limit,
+            "prop": "imageinfo",
+            "iiprop": "url|mime",
+            "iiurlwidth": 900,
+            "format": "json"
+        }
+
+        response = requests.get(
+            url,
+            params=params,
+            headers=COMMON_HEADERS,
+            timeout=8
+        )
+
+        data = response.json()
+
+        pages = data.get(
+            "query",
+            {}
+        ).get(
+            "pages",
+            {}
+        )
+
+        for page in pages.values():
+            imageinfo = page.get(
+                "imageinfo",
+                []
+            )
+
+            if not imageinfo:
+                continue
+
+            info = imageinfo[0]
+
+            image_url = (
+                info.get("thumburl")
+                or info.get("url")
+            )
+
+            if not image_url:
+                continue
+
+            mime = info.get("mime", "")
+
+            if not mime.startswith("image/"):
+                continue
+
+            images.append({
+                "title": page.get("title", ""),
+                "url": image_url,
+                "source": "Wikimedia Commons"
+            })
+
+    except Exception:
+        pass
+
+    return images
+
+
+# ============================================================
+# 10. TEMİZ METİN
+# ============================================================
 
 def clean_text(text):
-    text = re.sub(r"<[^>]+>", "", text)
-    text = re.sub(r"\s+", " ", text)
+    if not text:
+        return ""
+
+    text = html.unescape(text)
+
+    text = re.sub(
+        r"<script.*?</script>",
+        "",
+        text,
+        flags=re.I | re.S
+    )
+
+    text = re.sub(
+        r"<style.*?</style>",
+        "",
+        text,
+        flags=re.I | re.S
+    )
+
+    text = re.sub(
+        r"<[^>]+>",
+        "",
+        text
+    )
+
+    text = text.replace(
+        "\u00a0",
+        " "
+    )
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text
+    )
+
     return text.strip()
 
 
-def choose_best_result(results):
+# ============================================================
+# 11. KISA CEVAP SEÇİCİ
+# ============================================================
+
+def best_snippet(results):
     if not results:
         return None
 
-    cleaned = []
+    valid = []
 
-    for result in results:
-        title = clean_text(result.get("title", ""))
-        description = clean_text(
-            result.get("description", "")
+    for item in results:
+        snippet = clean_text(
+            item.get("snippet", "")
         )
 
-        if not title and not description:
-            continue
+        title = clean_text(
+            item.get("title", "")
+        )
 
-        cleaned.append({
-            **result,
-            "title": title,
-            "description": description
-        })
+        if snippet:
+            valid.append({
+                **item,
+                "snippet": snippet,
+                "title": title
+            })
 
-    if not cleaned:
+    if not valid:
         return None
 
-    # GitHub için yıldız sayısını da hesaba kat.
-    if cleaned[0].get("source") == "github":
-        cleaned.sort(
-            key=lambda x: x.get("stars", 0),
-            reverse=True
+    # Öncelik Wikipedia
+    wiki = [
+        x for x in valid
+        if x.get("source") == "wikipedia"
+    ]
+
+    if wiki:
+        return wiki[0]
+
+    return valid[0]
+
+
+# ============================================================
+# 12. KELİME TANIMI
+# ============================================================
+
+def answer_definition(word):
+    searches = [
+        wikipedia_search(
+            f"{word} nedir",
+            4
+        ),
+
+        duckduckgo_search(
+            f'"{word}" ne demek',
+            5
         )
+    ]
 
-    return cleaned[0]
+    results = []
 
+    for group in searches:
+        results.extend(group)
 
-def build_normal_answer(query, results):
-    """
-    Arama sonuçlarını kullanıcıya ham şekilde göstermiyoruz.
-    En uygun sonucu seçip doğal bir cevap haline getiriyoruz.
-    """
+    selected = best_snippet(results)
 
-    if not results:
+    if not selected:
         return (
-            "Bu konuda güvenilir bir bilgi bulamadım. "
-            "İstersen soruyu biraz daha ayrıntılı yazabilirsin."
+            f"“{word}” için güvenilir bir sonuç bulamadım.",
+            "bulunamadi",
+            []
         )
 
-    best = choose_best_result(results)
+    snippet = clean_text(
+        selected["snippet"]
+    )
 
-    if not best:
+    # Aşırı uzun sonuçları kısalt
+    if len(snippet) > 450:
+        snippet = snippet[:447] + "..."
+
+    answer = snippet
+
+    return (
+        answer,
+        selected.get("source", "web"),
+        []
+    )
+
+
+# ============================================================
+# 13. "BANA X DEDİ, NE DİYİM?"
+# ============================================================
+
+def answer_reply(word):
+    queries = [
+        f'"{word}" dedi ne cevap verilir',
+        f'"{word}" diyene ne denir',
+        f'"{word}" dedi ne demeliyim',
+        f'"{word}" cevabı ne'
+    ]
+
+    all_results = []
+
+    for query in queries:
+        all_results.extend(
+            duckduckgo_search(
+                query,
+                3
+            )
+        )
+
+    selected = best_snippet(
+        all_results
+    )
+
+    if not selected:
         return (
-            "Arama yaptım fakat kullanılabilir bir sonuç "
-            "bulamadım."
+            f"“{word}” denince şöyle cevap verebilirsin: "
+            f"“Teşekkür ederim, sen de sağ ol.”",
+            "cevap",
+            []
         )
 
-    title = best.get("title", "")
-    description = best.get("description", "")
-    source = best.get("source", "")
+    snippet = clean_text(
+        selected["snippet"]
+    )
 
-    if source == "github":
-        language = best.get("language", "")
-        stars = best.get("stars", 0)
+    if len(snippet) > 350:
+        snippet = snippet[:347] + "..."
 
-        answer_parts = []
+    return (
+        snippet,
+        "web",
+        []
+    )
 
-        answer_parts.append(
-            f"{query} konusunda GitHub'daki en uygun "
-            f"kaynaklardan biri **{title}**."
+
+# ============================================================
+# 14. GENEL ARAMA
+# ============================================================
+
+def general_search(query):
+    web_results = duckduckgo_search(
+        query,
+        6
+    )
+
+    wiki_results = wikipedia_search(
+        query,
+        3
+    )
+
+    combined = []
+
+    # Wikipedia'yı biraz öne al
+    combined.extend(wiki_results)
+    combined.extend(web_results)
+
+    selected = best_snippet(
+        combined
+    )
+
+    if not selected:
+        return (
+            "Bu konuda güvenilir bir sonuç bulamadım.",
+            "bulunamadi",
+            []
         )
 
-        if description:
-            answer_parts.append(description)
+    answer = clean_text(
+        selected["snippet"]
+    )
 
-        extra = []
+    if len(answer) > 600:
+        answer = answer[:597] + "..."
 
-        if language:
-            extra.append(f"Dil: {language}")
+    source_url = selected.get(
+        "url",
+        ""
+    )
 
-        if stars:
-            extra.append(f"⭐ {stars:,} yıldız".replace(",", "."))
-
-        if extra:
-            answer_parts.append(" • ".join(extra))
-
-        answer_parts.append(
-            f"Kaynak: {best.get('url', '')}"
+    if source_url:
+        answer += (
+            f"\n\nKaynak: {source_url}"
         )
 
-        return "\n\n".join(answer_parts)
-
-    # Wikipedia
-    answer_parts = []
-
-    if title:
-        answer_parts.append(
-            f"**{query}** hakkında bulduğum en uygun bilgi:"
-        )
-
-    if description:
-        answer_parts.append(description)
-
-    if title:
-        answer_parts.append(
-            f"Kaynak: {best.get('url', '')}"
-        )
-
-    return "\n\n".join(answer_parts)
+    return (
+        answer,
+        selected.get("source", "web"),
+        []
+    )
 
 
-# =========================================================
-# 7. MAIN AI ENGINE
-# =========================================================
+# ============================================================
+# 15. ANA CEVAP MOTORU
+# ============================================================
 
 def get_answer(kelime):
     normalized = normalize(kelime)
-    parts = analyze_query(kelime)
 
-    # Greeting
+    parts = analyze_query(
+        kelime
+    )
+
+    # Selamlama
     if parts["is_greeting"]:
         return (
             random.choice([
-                "Selam! Ben Vantorium. Hazırım, ne hakkında konuşalım?",
-                "Merhaba! Vantorium hazır. Sana nasıl yardımcı olabilirim?",
-                "Selam kral! Ne araştırmamı veya çözmemi istersin?"
+                "Selam! Ben Vantorium. Ne hakkında konuşalım?",
+                "Merhaba! Hazırım. Ne sormak istersin?",
+                "Selam! Sorunu gönder, hemen bakalım."
             ]),
-            "selamlama"
+            "selamlama",
+            []
         )
 
-    # Math
+    # Matematik
     if parts["is_math"]:
-        try:
-            result = safe_math(kelime)
-
-            if isinstance(result, float) and result.is_integer():
-                result = int(result)
-
-            return f"Sonuç: {result}", "matematik"
-
-        except Exception:
-            return (
-                "Bu matematik ifadesini güvenli şekilde çözemedim.",
-                "hata"
-            )
+        return (
+            calculate_math(kelime),
+            "matematik",
+            []
+        )
 
     # Dataset
-    if normalized in DATASET and DATASET[normalized]:
+    if (
+        normalized in DATASET
+        and DATASET[normalized]
+    ):
         return (
-            random.choice(DATASET[normalized]),
-            "veri_seti"
+            random.choice(
+                DATASET[normalized]
+            ),
+            "veri_seti",
+            []
         )
 
-    # Memory
-    cached = memory_get(normalized)
+    # Hafıza
+    cached = memory_get(
+        normalized
+    )
 
     if cached:
-        return cached, "hafiza"
+        return (
+            cached,
+            "hafiza",
+            []
+        )
 
-    # Search
-    results = search_web(kelime, parts)
+    # "X ne demek?"
+    if parts["definition_word"]:
+        answer, source, images = answer_definition(
+            parts["definition_word"]
+        )
 
-    if results:
-        answer = build_normal_answer(
-            kelime,
-            results
+        memory_save(
+            normalized,
+            answer,
+            0.88,
+            source
+        )
+
+        return answer, source, images
+
+    # "Bana X dedi, ne diyeyim?"
+    if parts["reply_word"]:
+        answer, source, images = answer_reply(
+            parts["reply_word"]
         )
 
         memory_save(
             normalized,
             answer,
             0.85,
-            results[0].get("source", "web")
+            source
         )
 
-        return answer, results[0].get(
-            "source",
-            "web"
+        return answer, source, images
+
+    # Kod sorusu -> GitHub
+    if parts["is_code"]:
+        github_results = github_search(
+            kelime,
+            5
         )
+
+        selected = best_snippet(
+            github_results
+        )
+
+        if selected:
+            answer = clean_text(
+                selected["snippet"]
+            )
+
+            if len(answer) > 500:
+                answer = answer[:497] + "..."
+
+            answer += (
+                "\n\nGitHub: "
+                + selected.get(
+                    "url",
+                    ""
+                )
+            )
+
+            memory_save(
+                normalized,
+                answer,
+                0.90,
+                "github"
+            )
+
+            return (
+                answer,
+                "github",
+                []
+            )
+
+    # Normal arama
+    answer, source, images = general_search(
+        kelime
+    )
+
+    # Görsel istendiyse
+    if parts["image_request"]:
+        images = image_search(
+            kelime,
+            6
+        )
+
+    memory_save(
+        normalized,
+        answer,
+        0.80,
+        source
+    )
 
     return (
-        "Bunu şu anda bilmiyorum ve kullanılabilir "
-        "bir kaynak da bulamadım.",
-        "bulunamadi"
+        answer,
+        source,
+        images
     )
 
 
-# =========================================================
-# 8. AUTH
-# =========================================================
+# ============================================================
+# 16. KULLANICI
+# ============================================================
 
 def get_current_user():
-    token = request.cookies.get("session_token")
+    token = request.cookies.get(
+        "session_token"
+    )
 
     if not token:
         return None
@@ -668,35 +1013,23 @@ def get_current_user():
     return row
 
 
-def login_required(func):
-    @wraps(func)
+def login_required(f):
+    @wraps(f)
     def decorated(*args, **kwargs):
         if not get_current_user():
             return redirect("/login")
 
-        return func(*args, **kwargs)
+        return f(*args, **kwargs)
 
     return decorated
 
 
-# =========================================================
-# 9. UI
-# =========================================================
+# ============================================================
+# 17. TASARIM
+# ============================================================
 
 BASE_STYLE = """
 <style>
-
-:root {
-    --bg: #07090d;
-    --panel: #0e1117;
-    --panel2: #12161d;
-    --border: rgba(255,255,255,.08);
-    --muted: #8b93a1;
-    --text: #f4f7fb;
-    --green: #18d49b;
-    --green2: #0ea878;
-    --danger: #ef4444;
-}
 
 * {
     box-sizing: border-box;
@@ -704,9 +1037,9 @@ BASE_STYLE = """
     padding: 0;
 }
 
-html,
-body {
-    min-height: 100%;
+html {
+    background: #07090b;
+    color-scheme: dark;
 }
 
 body {
@@ -716,55 +1049,59 @@ body {
         BlinkMacSystemFont,
         "Segoe UI",
         Roboto,
+        Arial,
         sans-serif;
 
     background:
         radial-gradient(
             circle at 50% -20%,
-            rgba(24,212,155,.12),
-            transparent 40%
+            rgba(16,163,127,.12),
+            transparent 38%
         ),
-        var(--bg);
+        #07090b;
 
-    color: var(--text);
+    color: #f4f4f5;
+    min-height: 100vh;
 
     -webkit-font-smoothing: antialiased;
     text-rendering: optimizeLegibility;
 }
 
 a {
-    color: inherit;
+    color: #19d3a2;
     text-decoration: none;
 }
 
 button,
 input {
-    font: inherit;
+    font-family: inherit;
 }
 
-
-/* =====================================================
-   NAVBAR
-===================================================== */
+/* NAVBAR */
 
 .navbar {
-    position: sticky;
-    top: 0;
-    z-index: 100;
-
     height: 68px;
+    padding: 0 22px;
 
     display: flex;
     align-items: center;
     justify-content: space-between;
 
-    padding: 0 22px;
+    position: sticky;
+    top: 0;
+    z-index: 1000;
 
-    background: rgba(7,9,13,.78);
-    backdrop-filter: blur(22px);
-    -webkit-backdrop-filter: blur(22px);
+    background:
+        rgba(7,9,11,.78);
 
-    border-bottom: 1px solid var(--border);
+    backdrop-filter:
+        blur(20px);
+
+    -webkit-backdrop-filter:
+        blur(20px);
+
+    border-bottom:
+        1px solid rgba(255,255,255,.07);
 }
 
 .logo {
@@ -772,6 +1109,8 @@ input {
     align-items: center;
     gap: 11px;
 
+    color: white;
+    font-size: 18px;
     font-weight: 800;
     letter-spacing: -.5px;
 }
@@ -780,21 +1119,22 @@ input {
     width: 34px;
     height: 34px;
 
+    border-radius: 11px;
+
     display: flex;
     align-items: center;
     justify-content: center;
 
-    border-radius: 11px;
-
     background:
         linear-gradient(
             135deg,
-            #1ee6a9,
-            #0d9b74
+            #20e3ad,
+            #08a879
         );
 
     box-shadow:
-        0 8px 30px rgba(24,212,155,.2);
+        0 8px 30px
+        rgba(16,163,127,.25);
 
     font-weight: 900;
 }
@@ -806,13 +1146,11 @@ input {
 }
 
 .btn-nav {
-    padding: 9px 13px;
-
+    color: #a1a1aa;
+    padding: 9px 12px;
     border-radius: 9px;
 
-    color: #9ba3b0;
-
-    font-size: 13px;
+    font-size: 14px;
     font-weight: 600;
 
     transition:
@@ -825,24 +1163,18 @@ input {
 }
 
 .btn-nav.primary {
-    color: #04140f;
-
-    background: var(--green);
-
-    box-shadow:
-        0 8px 25px rgba(24,212,155,.16);
+    color: white;
+    background: #10a37f;
 }
 
 .btn-nav.primary:hover {
-    background: #2be8ae;
+    background: #12b98e;
+    transform: translateY(-1px);
 }
 
+/* AUTH */
 
-/* =====================================================
-   AUTH
-===================================================== */
-
-.auth-page {
+.auth-wrapper {
     min-height:
         calc(100vh - 68px);
 
@@ -850,116 +1182,68 @@ input {
     align-items: center;
     justify-content: center;
 
-    padding: 35px 18px;
+    padding: 28px 18px;
 }
 
-.auth-panel {
+.container {
     width: 100%;
     max-width: 430px;
 
-    padding: 30px;
+    padding: 34px;
 
     background:
-        linear-gradient(
-            180deg,
-            rgba(18,22,29,.97),
-            rgba(11,14,19,.97)
-        );
+        rgba(17,19,23,.82);
 
-    border: 1px solid var(--border);
+    border:
+        1px solid rgba(255,255,255,.08);
 
     border-radius: 22px;
 
     box-shadow:
-        0 30px 100px rgba(0,0,0,.45);
+        0 30px 100px
+        rgba(0,0,0,.35);
 
-    animation:
-        panelIn .35s ease;
+    backdrop-filter: blur(20px);
 }
 
-@keyframes panelIn {
-    from {
-        opacity: 0;
-        transform: translateY(12px) scale(.98);
-    }
-
-    to {
-        opacity: 1;
-        transform: none;
-    }
+.container.wide {
+    max-width: 1000px;
+    margin: 35px auto;
 }
 
-.auth-brand {
-    text-align: center;
-    margin-bottom: 25px;
-}
-
-.auth-brand .mini-logo {
-    width: 50px;
-    height: 50px;
-
-    margin: 0 auto 15px;
-
-    display: flex;
-    align-items: center;
-    justify-content: center;
-
-    border-radius: 15px;
-
-    background:
-        linear-gradient(
-            135deg,
-            #1ee6a9,
-            #0b956e
-        );
-
-    font-size: 21px;
-    font-weight: 900;
-
-    box-shadow:
-        0 15px 45px rgba(24,212,155,.18);
-}
-
-.auth-brand h1 {
-    font-size: 23px;
+h2 {
+    font-size: 25px;
     letter-spacing: -.7px;
+    margin-bottom: 7px;
 }
 
-.auth-brand p {
-    margin-top: 7px;
-
-    color: var(--muted);
-
-    font-size: 13px;
-    line-height: 1.5;
-}
-
-.form-group {
-    margin-bottom: 16px;
+.subtitle {
+    color: #8f939b;
+    font-size: 14px;
+    line-height: 1.6;
+    margin-bottom: 25px;
 }
 
 label {
     display: block;
-
+    color: #cfd1d5;
+    font-size: 13px;
+    font-weight: 600;
     margin-bottom: 7px;
-
-    color: #cbd1da;
-
-    font-size: 12px;
-    font-weight: 700;
 }
 
 input[type=text],
 input[type=password] {
     width: 100%;
-
     padding: 13px 14px;
 
+    margin-bottom: 18px;
+
     color: white;
+    background: #0b0e12;
 
-    background: #080b10;
-
-    border: 1px solid rgba(255,255,255,.09);
+    border:
+        1px solid #252a31;
 
     border-radius: 11px;
 
@@ -969,168 +1253,73 @@ input[type=password] {
 }
 
 input:focus {
-    border-color: rgba(24,212,155,.65);
+    border-color: #10a37f;
 
     box-shadow:
-        0 0 0 4px rgba(24,212,155,.09);
+        0 0 0 4px
+        rgba(16,163,127,.11);
 }
 
-.main-btn {
+.btn {
     width: 100%;
+    border: 0;
 
     padding: 13px;
 
-    border: 0;
+    color: white;
+    background: #10a37f;
+
     border-radius: 11px;
 
+    font-weight: 700;
     cursor: pointer;
-
-    color: #03140f;
-
-    background: var(--green);
-
-    font-weight: 800;
 
     transition: .2s ease;
 }
 
-.main-btn:hover {
-    background: #2be8ae;
-
+.btn:hover {
+    background: #12b98e;
     transform: translateY(-1px);
 }
 
-.error {
-    margin-bottom: 17px;
+.link-row {
+    margin-top: 22px;
+    text-align: center;
 
-    padding: 12px 13px;
+    color: #777b83;
+    font-size: 14px;
+}
+
+.error {
+    padding: 12px 14px;
+    margin-bottom: 18px;
+
+    color: #ff8d8d;
+
+    background:
+        rgba(239,68,68,.09);
+
+    border:
+        1px solid
+        rgba(239,68,68,.18);
 
     border-radius: 11px;
 
-    background: rgba(239,68,68,.08);
-
-    border: 1px solid rgba(239,68,68,.16);
-
-    color: #ff8b8b;
-
     font-size: 13px;
 }
 
+/* CARDS */
 
-/* POLICY BOX */
+.card {
+    padding: 25px;
 
-.policy-box {
-    margin-top: 22px;
-
-    padding: 15px;
-
-    border-radius: 14px;
+    margin-bottom: 18px;
 
     background:
-        rgba(255,255,255,.025);
+        rgba(17,19,23,.78);
 
     border:
         1px solid rgba(255,255,255,.07);
-}
-
-.policy-title {
-    display: flex;
-    align-items: center;
-    gap: 9px;
-
-    margin-bottom: 7px;
-
-    font-size: 13px;
-    font-weight: 800;
-}
-
-.policy-icon {
-    width: 28px;
-    height: 28px;
-
-    display: flex;
-    align-items: center;
-    justify-content: center;
-
-    border-radius: 8px;
-
-    background: rgba(24,212,155,.1);
-
-    color: var(--green);
-}
-
-.policy-box p {
-    color: #7f8794;
-
-    font-size: 12px;
-    line-height: 1.55;
-
-    margin-bottom: 10px;
-}
-
-.policy-link {
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-
-    color: var(--green);
-
-    font-size: 12px;
-    font-weight: 700;
-}
-
-.auth-switch {
-    text-align: center;
-
-    margin-top: 18px;
-
-    color: #747d8b;
-
-    font-size: 13px;
-}
-
-.auth-switch a {
-    color: var(--green);
-    font-weight: 700;
-}
-
-
-/* =====================================================
-   DASHBOARD
-===================================================== */
-
-.container {
-    width: 100%;
-    max-width: 980px;
-
-    margin: 0 auto;
-
-    padding: 42px 20px;
-}
-
-.page-title {
-    font-size: 30px;
-    letter-spacing: -1px;
-}
-
-.subtitle {
-    margin-top: 7px;
-
-    color: var(--muted);
-
-    font-size: 14px;
-    line-height: 1.6;
-}
-
-.card {
-    margin-top: 20px;
-
-    padding: 24px;
-
-    background:
-        rgba(14,17,23,.9);
-
-    border: 1px solid var(--border);
 
     border-radius: 17px;
 }
@@ -1138,91 +1327,93 @@ input:focus {
 .card h3 {
     margin-bottom: 14px;
 
-    font-size: 15px;
+    font-size: 16px;
 }
 
 .card p {
-    color: #929aa7;
-
-    font-size: 13px;
-    line-height: 1.7;
+    color: #a4a7ad;
+    font-size: 14px;
+    line-height: 1.75;
 }
 
 .api-key-box {
-    margin-top: 12px;
-
     padding: 14px;
 
-    background: #080b10;
+    margin-bottom: 13px;
 
-    border: 1px solid rgba(255,255,255,.07);
+    color: #1ce0ad;
+
+    background: #090c0f;
+
+    border:
+        1px solid #22272d;
 
     border-radius: 10px;
 
-    color: var(--green);
-
-    font-family: monospace;
+    font-family:
+        "SFMono-Regular",
+        Consolas,
+        monospace;
 
     word-break: break-all;
 }
 
 .code-block {
-    margin-top: 12px;
-
     padding: 15px;
 
-    background: #070a0e;
-
-    border: 1px solid rgba(255,255,255,.07);
-
-    border-radius: 10px;
+    margin: 12px 0;
 
     overflow-x: auto;
 
-    color: #cfd6df;
+    color: #ddd;
 
-    font-family: monospace;
+    background: #090c0f;
 
-    font-size: 12px;
+    border:
+        1px solid #22272d;
 
+    border-radius: 11px;
+
+    font-family:
+        "SFMono-Regular",
+        Consolas,
+        monospace;
+
+    font-size: 13px;
     line-height: 1.6;
 }
 
-.small-danger {
-    margin-top: 14px;
-
-    padding: 10px 14px;
-
-    border: 0;
-    border-radius: 9px;
-
-    color: white;
-
-    background: var(--danger);
-
-    cursor: pointer;
-
-    font-size: 12px;
-    font-weight: 700;
+h1.page-title {
+    font-size: 30px;
+    letter-spacing: -.8px;
+    margin-bottom: 7px;
 }
 
+h2.section-title {
+    margin: 38px 0 15px;
+    font-size: 18px;
+}
 
-/* =====================================================
-   CHAT
-===================================================== */
+.footer {
+    text-align: center;
+    padding: 35px;
+    color: #555a62;
+    font-size: 12px;
+}
 
-.chat-shell {
+/* CHAT */
+
+.chat-layout {
     height:
         calc(100vh - 68px);
 
-    display: flex;
-    flex-direction: column;
-
     max-width: 980px;
+    width: 100%;
 
     margin: 0 auto;
 
-    width: 100%;
+    display: flex;
+    flex-direction: column;
 }
 
 .chat-history {
@@ -1231,11 +1422,10 @@ input:focus {
     overflow-y: auto;
 
     padding:
-        28px
-        20px
-        160px;
+        30px 20px
+        130px 20px;
 
-    scrollbar-width: thin;
+    scroll-behavior: smooth;
 }
 
 .chat-history::-webkit-scrollbar {
@@ -1243,26 +1433,21 @@ input:focus {
 }
 
 .chat-history::-webkit-scrollbar-thumb {
-    background: #252b34;
-
-    border-radius: 20px;
+    background: #24282e;
+    border-radius: 10px;
 }
 
 .chat-msg {
-    width: 100%;
-    max-width: 850px;
-
-    margin: 0 auto 25px;
-
     display: flex;
+    gap: 13px;
 
-    gap: 12px;
+    margin-bottom: 27px;
 
     animation:
-        msgIn .25s ease;
+        messageIn .25s ease;
 }
 
-@keyframes msgIn {
+@keyframes messageIn {
     from {
         opacity: 0;
         transform: translateY(5px);
@@ -1270,7 +1455,7 @@ input:focus {
 
     to {
         opacity: 1;
-        transform: none;
+        transform: translateY(0);
     }
 }
 
@@ -1290,106 +1475,80 @@ input:focus {
 
     border-radius: 11px;
 
-    font-size: 12px;
-    font-weight: 900;
+    font-weight: 800;
+    font-size: 13px;
 }
 
 .chat-msg.ai .avatar {
     background:
         linear-gradient(
             135deg,
-            #19d9a0,
-            #0b986f
+            #18d9a6,
+            #079d77
         );
 
-    color: #03140f;
-
     box-shadow:
-        0 8px 25px rgba(24,212,155,.12);
+        0 7px 22px
+        rgba(16,163,127,.2);
 }
 
 .chat-msg.user .avatar {
-    order: 2;
-
-    background: #1c222c;
-
-    color: white;
+    background: #20252d;
 }
 
 .msg-content {
-    max-width: min(720px, 78%);
+    max-width: min(760px, 82vw);
 
-    color: #e7ebf0;
+    color: #e9eaec;
 
     font-size: 15px;
     line-height: 1.75;
 
+    padding-top: 3px;
+
     white-space: pre-wrap;
 
-    word-break: break-word;
+    overflow-wrap: anywhere;
 }
 
 .chat-msg.user .msg-content {
-    order: 1;
-
-    padding:
-        11px
-        15px;
-
-    border-radius: 16px;
-
-    border-top-right-radius: 5px;
+    padding: 11px 16px;
 
     background:
-        #171d26;
+        #191e25;
+
+    border-radius: 17px;
+    border-top-right-radius: 5px;
 }
 
+/* THINKING */
 
-/* thinking */
-
-.thinking-box {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-
-    padding-top: 1px;
-}
-
-.thinking-main {
-    color: #dfe6ed;
-
-    font-weight: 600;
-}
-
-.thinking-status {
-    display: flex;
+.thinking {
+    display: inline-flex;
     align-items: center;
-    gap: 8px;
+    gap: 9px;
 
-    color: #788291;
+    color: #8e949d;
 
-    font-size: 12px;
+    font-size: 14px;
 }
 
-.loader {
-    width: 8px;
-    height: 8px;
+.thinking-dot {
+    width: 7px;
+    height: 7px;
 
     border-radius: 50%;
 
-    background: var(--green);
-
-    box-shadow:
-        0 0 15px rgba(24,212,155,.65);
+    background: #17d5a4;
 
     animation:
-        pulse 1s infinite;
+        pulseDot 1s infinite ease-in-out;
 }
 
-@keyframes pulse {
+@keyframes pulseDot {
     0%,100% {
-        opacity: .3;
-        transform: scale(.75);
+        opacity: .25;
+        transform: scale(.7);
     }
 
     50% {
@@ -1398,70 +1557,117 @@ input:focus {
     }
 }
 
+/* SOURCE */
+
+.source {
+    margin-top: 13px;
+
+    color: #6f767f;
+
+    font-size: 12px;
+}
+
+.source a {
+    color: #18c99b;
+}
+
+/* IMAGES */
+
+.image-grid {
+    display: grid;
+
+    grid-template-columns:
+        repeat(3, minmax(0, 1fr));
+
+    gap: 8px;
+
+    margin-top: 15px;
+}
+
+.image-card {
+    position: relative;
+    overflow: hidden;
+
+    border-radius: 12px;
+
+    aspect-ratio: 1 / 1;
+
+    background: #11151a;
+
+    border:
+        1px solid rgba(255,255,255,.07);
+}
+
+.image-card img {
+    width: 100%;
+    height: 100%;
+
+    object-fit: cover;
+
+    transition: .25s ease;
+}
+
+.image-card:hover img {
+    transform: scale(1.04);
+}
 
 /* INPUT */
 
-.chat-composer {
+.chat-input-area {
     position: fixed;
 
     left: 50%;
+    bottom: 14px;
 
-    bottom: 0;
+    transform:
+        translateX(-50%);
 
-    transform: translateX(-50%);
+    width:
+        min(940px, calc(100% - 24px));
 
-    width: min(900px, calc(100% - 28px));
-
-    padding:
-        15px
-        0
-        22px;
-
-    background:
-        linear-gradient(
-            to bottom,
-            transparent,
-            var(--bg) 25%
-        );
-
-    z-index: 20;
+    z-index: 500;
 }
 
-.composer-box {
+.chat-input-box {
     position: relative;
 
-    background: #11161e;
+    padding: 6px;
+
+    background:
+        rgba(12,15,19,.88);
 
     border:
-        1px solid rgba(255,255,255,.09);
+        1px solid rgba(255,255,255,.10);
 
-    border-radius: 17px;
+    border-radius: 19px;
 
     box-shadow:
-        0 20px 60px rgba(0,0,0,.4);
+        0 20px 60px
+        rgba(0,0,0,.45);
+
+    backdrop-filter: blur(20px);
 }
 
-.composer-box input {
+.chat-input-box input {
     width: 100%;
 
     padding:
-        17px
-        58px
-        17px
-        17px;
+        15px 60px 15px 17px;
+
+    margin: 0;
+
+    border: 0;
 
     color: white;
 
     background: transparent;
 
-    border: 0;
-
     outline: none;
 
-    font-size: 14px;
+    font-size: 15px;
 }
 
-.send-btn {
+.chat-input-box button {
     position: absolute;
 
     right: 8px;
@@ -1470,195 +1676,101 @@ input:focus {
     transform:
         translateY(-50%);
 
-    width: 38px;
-    height: 38px;
+    width: 42px;
+    height: 42px;
 
     border: 0;
-
-    border-radius: 11px;
+    border-radius: 13px;
 
     display: flex;
     align-items: center;
     justify-content: center;
 
-    color: #03140f;
+    color: white;
 
-    background: var(--green);
+    background:
+        linear-gradient(
+            135deg,
+            #19dca9,
+            #0ab687
+        );
 
     cursor: pointer;
 
     transition: .2s ease;
 }
 
-.send-btn:hover {
+.chat-input-box button:hover {
     transform:
         translateY(-50%)
         scale(1.04);
 }
 
-.send-btn:disabled {
+.chat-input-box button:disabled {
     opacity: .45;
-    cursor: not-allowed;
 }
 
+/* RESPONSIVE */
 
-/* =====================================================
-   INFO
-===================================================== */
-
-.info-card {
-    margin-top: 18px;
-
-    padding: 22px;
-
-    background: rgba(14,17,23,.9);
-
-    border: 1px solid var(--border);
-
-    border-radius: 16px;
-}
-
-.info-card h2 {
-    margin-bottom: 11px;
-
-    font-size: 16px;
-}
-
-.info-card p,
-.info-card li {
-    color: #929aa7;
-
-    font-size: 13px;
-    line-height: 1.8;
-}
-
-.info-card ul {
-    padding-left: 19px;
-}
-
-.footer {
-    padding: 35px 20px;
-
-    text-align: center;
-
-    color: #555d69;
-
-    font-size: 12px;
-}
-
-
-/* =====================================================
-   MOBILE
-===================================================== */
-
-@media(max-width: 650px) {
+@media (max-width: 650px) {
 
     .navbar {
-        height: 60px;
-
-        padding:
-            0 13px;
-    }
-
-    .nav-actions {
-        gap: 2px;
-    }
-
-    .btn-nav {
-        padding:
-            8px 7px;
-
-        font-size: 11px;
+        padding: 0 14px;
     }
 
     .logo {
-        font-size: 15px;
+        font-size: 16px;
     }
 
-    .logo-icon {
-        width: 30px;
-        height: 30px;
+    .nav-actions {
+        gap: 1px;
     }
 
-    .auth-page {
-        min-height:
-            calc(100vh - 60px);
-
-        padding:
-            18px 13px;
-    }
-
-    .auth-panel {
-        padding: 22px 18px;
-
-        border-radius: 19px;
+    .btn-nav {
+        padding: 8px 7px;
+        font-size: 12px;
     }
 
     .container {
-        padding:
-            27px 14px;
-    }
-
-    .page-title {
-        font-size: 25px;
-    }
-
-    .chat-shell {
-        height:
-            calc(100vh - 60px);
+        padding: 25px 20px;
     }
 
     .chat-history {
-        padding:
-            20px
-            12px
-            145px;
-    }
-
-    .chat-msg {
-        gap: 9px;
-        margin-bottom: 21px;
-    }
-
-    .avatar {
-        width: 31px;
-        height: 31px;
-        flex-basis: 31px;
+        padding-left: 13px;
+        padding-right: 13px;
     }
 
     .msg-content {
-        max-width: 82%;
-
         font-size: 14px;
-        line-height: 1.65;
     }
 
-    .chat-composer {
-        width:
-            calc(100% - 18px);
-
-        padding-bottom: 13px;
+    .image-grid {
+        grid-template-columns:
+            repeat(2, minmax(0, 1fr));
     }
-
 }
 
 </style>
 
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-
 <link
-    href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap"
+    href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap"
     rel="stylesheet"
 >
 """
 
 
-# =========================================================
-# 10. PAGE RENDER
-# =========================================================
+# ============================================================
+# 18. SAYFA RENDER
+# ============================================================
 
-def render_page(title, content, user=None, show_nav=True):
+def render_page(
+    title,
+    content,
+    user=None,
+    show_nav=True
+):
 
     nav = ""
 
@@ -1667,19 +1779,23 @@ def render_page(title, content, user=None, show_nav=True):
         if user:
 
             actions = """
-                <a href="/dashboard" class="btn-nav">
+                <a href="/dashboard"
+                   class="btn-nav">
                     Dashboard
                 </a>
 
-                <a href="/chat" class="btn-nav">
+                <a href="/chat"
+                   class="btn-nav">
                     Sohbet
                 </a>
 
-                <a href="/info" class="btn-nav">
+                <a href="/info"
+                   class="btn-nav">
                     Bilgi
                 </a>
 
-                <a href="/logout" class="btn-nav">
+                <a href="/logout"
+                   class="btn-nav">
                     Çıkış
                 </a>
             """
@@ -1687,24 +1803,30 @@ def render_page(title, content, user=None, show_nav=True):
         else:
 
             actions = """
-                <a href="/info" class="btn-nav">
+                <a href="/info"
+                   class="btn-nav">
                     Bilgi
                 </a>
 
-                <a href="/login" class="btn-nav">
+                <a href="/login"
+                   class="btn-nav">
                     Giriş
                 </a>
 
-                <a href="/register" class="btn-nav primary">
+                <a href="/register"
+                   class="btn-nav primary">
                     Kayıt Ol
                 </a>
             """
 
         nav = f"""
-        <nav class="navbar">
+        <div class="navbar">
 
             <a href="/" class="logo">
-                <span class="logo-icon">V</span>
+                <div class="logo-icon">
+                    V
+                </div>
+
                 Vantorium
             </a>
 
@@ -1712,215 +1834,76 @@ def render_page(title, content, user=None, show_nav=True):
                 {actions}
             </div>
 
-        </nav>
-        """
-
-    return f"""
-<!DOCTYPE html>
-
-<html lang="tr">
-
-<head>
-
-<meta charset="UTF-8">
-
-<meta
-    name="viewport"
-    content="width=device-width, initial-scale=1.0, viewport-fit=cover"
->
-
-<meta
-    name="theme-color"
-    content="#07090d"
->
-
-<title>{title} | Vantorium</title>
-
-{BASE_STYLE}
-
-</head>
-
-<body>
-
-{nav}
-
-{content}
-
-</body>
-
-</html>
-"""
-
-
-# =========================================================
-# 11. AUTH PAGE
-# =========================================================
-
-def auth_page(
-    title,
-    heading,
-    description,
-    action,
-    action_text,
-    switch_text,
-    switch_link,
-    switch_label,
-    error=None
-):
-
-    error_html = ""
-
-    if error:
-        error_html = f"""
-        <div class="error">
-            {error}
         </div>
         """
 
-    content = f"""
-    <main class="auth-page">
+    return f"""
+    <!DOCTYPE html>
 
-        <section class="auth-panel">
+    <html lang="tr">
 
-            <div class="auth-brand">
+    <head>
 
-                <div class="mini-logo">
-                    V
-                </div>
+        <meta charset="UTF-8">
 
-                <h1>
-                    {heading}
-                </h1>
+        <meta
+            name="viewport"
+            content="width=device-width,
+            initial-scale=1.0,
+            maximum-scale=1.0,
+            user-scalable=no"
+        >
 
-                <p>
-                    {description}
-                </p>
+        <meta
+            name="theme-color"
+            content="#07090b"
+        >
 
-            </div>
+        <title>
+            {html.escape(title)} | Vantorium
+        </title>
 
-            {error_html}
+        {BASE_STYLE}
 
-            <form
-                method="POST"
-                action="{action}"
-            >
+    </head>
 
-                <div class="form-group">
+    <body>
 
-                    <label>
-                        Kullanıcı Adı
-                    </label>
+        {nav}
 
-                    <input
-                        type="text"
-                        name="username"
-                        required
-                        autocomplete="username"
-                        placeholder="kullanici_adi"
-                    >
+        {content}
 
-                </div>
+    </body>
 
-                <div class="form-group">
-
-                    <label>
-                        Şifre
-                    </label>
-
-                    <input
-                        type="password"
-                        name="password"
-                        required
-                        autocomplete="{
-                            'new-password'
-                            if action == '/register'
-                            else 'current-password'
-                        }"
-                        placeholder="••••••••"
-                    >
-
-                </div>
-
-                <button
-                    type="submit"
-                    class="main-btn"
-                >
-                    {action_text}
-                </button>
-
-            </form>
-
-
-            <!-- KURALLAR / POLİTİKALAR -->
-
-            <div class="policy-box">
-
-                <div class="policy-title">
-
-                    <span class="policy-icon">
-                        ✓
-                    </span>
-
-                    Kurallar ve Politikalar
-
-                </div>
-
-                <p>
-                    Vantorium'u kullanarak hizmet şartlarını,
-                    kullanım kurallarını ve gizlilik politikasını
-                    kabul etmiş olursun.
-                </p>
-
-                <a
-                    href="https://api-vantorium-xyz-production.up.railway.app/info"
-                    class="policy-link"
-                >
-                    Kuralları ve politikaları incele →
-                </a>
-
-            </div>
-
-
-            <div class="auth-switch">
-
-                {switch_text}
-
-                <a href="{switch_link}">
-                    {switch_label}
-                </a>
-
-            </div>
-
-        </section>
-
-    </main>
+    </html>
     """
 
-    return render_page(
-        title,
-        content,
-        show_nav=True
-    )
 
-
-# =========================================================
-# 12. ROUTES
-# =========================================================
+# ============================================================
+# 19. ANA SAYFA
+# ============================================================
 
 @app.route("/")
 def index():
 
     if get_current_user():
-        return redirect("/dashboard")
+        return redirect("/chat")
 
     return redirect("/login")
 
 
-@app.route("/register", methods=["GET", "POST"])
+# ============================================================
+# 20. KAYIT
+# ============================================================
+
+@app.route(
+    "/register",
+    methods=["GET", "POST"]
+)
 def register():
 
     if get_current_user():
-        return redirect("/dashboard")
+        return redirect("/chat")
 
     error = None
 
@@ -1936,24 +1919,14 @@ def register():
             ""
         )
 
-        if len(username) < 3:
+        if (
+            len(username) < 3
+            or len(password) < 6
+        ):
 
             error = (
-                "Kullanıcı adı en az 3 karakter "
-                "olmalı."
-            )
-
-        elif len(username) > 30:
-
-            error = (
-                "Kullanıcı adı en fazla 30 karakter "
-                "olabilir."
-            )
-
-        elif len(password) < 6:
-
-            error = (
-                "Şifre en az 6 karakter olmalı."
+                "Kullanıcı adı en az 3, "
+                "şifre en az 6 karakter olmalı."
             )
 
         else:
@@ -1961,7 +1934,8 @@ def register():
             conn = db()
 
             exists = conn.execute(
-                "SELECT id FROM users WHERE username = ?",
+                "SELECT id FROM users "
+                "WHERE username = ?",
                 (username,)
             ).fetchone()
 
@@ -1982,7 +1956,12 @@ def register():
 
                 conn.execute("""
                     INSERT INTO users
-                    (username, password_hash, api_key, created_at)
+                    (
+                        username,
+                        password_hash,
+                        api_key,
+                        created_at
+                    )
                     VALUES (?, ?, ?, ?)
                 """, (
                     username,
@@ -1996,24 +1975,91 @@ def register():
 
                 return redirect("/login")
 
-    return auth_page(
-        "Kayıt Ol",
-        "Vantorium'a Katıl",
-        "Kendi hesabını oluştur ve Vantorium API'ni kullanmaya başla.",
-        "/register",
-        "Hesap Oluştur",
-        "Zaten hesabın var mı?",
-        "/login",
-        "Giriş Yap",
-        error
+    content = f"""
+
+    <div class="auth-wrapper">
+
+        <div class="container">
+
+            <h2>
+                Hesap Oluştur
+            </h2>
+
+            <p class="subtitle">
+                Vantorium'a katıl ve
+                kendi API anahtarını oluştur.
+            </p>
+
+            {f'<div class="error">{html.escape(error)}</div>' if error else ''}
+
+            <form method="POST">
+
+                <label>
+                    Kullanıcı Adı
+                </label>
+
+                <input
+                    type="text"
+                    name="username"
+                    required
+                    autocomplete="username"
+                    placeholder="kullanici_adi"
+                >
+
+                <label>
+                    Şifre
+                </label>
+
+                <input
+                    type="password"
+                    name="password"
+                    required
+                    autocomplete="new-password"
+                    placeholder="••••••••"
+                >
+
+                <button
+                    type="submit"
+                    class="btn"
+                >
+                    Kayıt Ol
+                </button>
+
+            </form>
+
+            <div class="link-row">
+
+                Hesabın var mı?
+                <a href="/login">
+                    Giriş Yap
+                </a>
+
+            </div>
+
+        </div>
+
+    </div>
+
+    """
+
+    return render_page(
+        "Kayıt",
+        content
     )
 
 
-@app.route("/login", methods=["GET", "POST"])
+# ============================================================
+# 21. GİRİŞ
+# ============================================================
+
+@app.route(
+    "/login",
+    methods=["GET", "POST"]
+)
 def login():
 
     if get_current_user():
-        return redirect("/dashboard")
+        return redirect("/chat")
 
     error = None
 
@@ -2032,11 +2078,16 @@ def login():
         conn = db()
 
         user = conn.execute(
-            "SELECT * FROM users WHERE username = ?",
+            "SELECT * FROM users "
+            "WHERE username = ?",
             (username,)
         ).fetchone()
 
-        if user and user["password_hash"] == hash_password(password):
+        if (
+            user
+            and user["password_hash"]
+            == hash_password(password)
+        ):
 
             token = secrets.token_hex(32)
 
@@ -2054,36 +2105,101 @@ def login():
             conn.close()
 
             response = make_response(
-                redirect("/dashboard")
+                redirect("/chat")
             )
 
             response.set_cookie(
                 "session_token",
                 token,
                 httponly=True,
-                secure=request.is_secure,
+                secure=True,
                 samesite="Lax",
                 max_age=30 * 24 * 3600
             )
 
             return response
 
-        error = "Kullanıcı adı veya şifre hatalı."
+        error = (
+            "Kullanıcı adı veya şifre hatalı."
+        )
 
         conn.close()
 
-    return auth_page(
+    content = f"""
+
+    <div class="auth-wrapper">
+
+        <div class="container">
+
+            <h2>
+                Tekrar Hoş Geldin
+            </h2>
+
+            <p class="subtitle">
+                Vantorium hesabına giriş yap.
+            </p>
+
+            {f'<div class="error">{html.escape(error)}</div>' if error else ''}
+
+            <form method="POST">
+
+                <label>
+                    Kullanıcı Adı
+                </label>
+
+                <input
+                    type="text"
+                    name="username"
+                    required
+                    autocomplete="username"
+                    placeholder="kullanici_adi"
+                >
+
+                <label>
+                    Şifre
+                </label>
+
+                <input
+                    type="password"
+                    name="password"
+                    required
+                    autocomplete="current-password"
+                    placeholder="••••••••"
+                >
+
+                <button
+                    type="submit"
+                    class="btn"
+                >
+                    Giriş Yap
+                </button>
+
+            </form>
+
+            <div class="link-row">
+
+                Hesabın yok mu?
+                <a href="/register">
+                    Kayıt Ol
+                </a>
+
+            </div>
+
+        </div>
+
+    </div>
+
+    """
+
+    return render_page(
         "Giriş",
-        "Tekrar Hoş Geldin",
-        "Vantorium hesabına giriş yap ve yapay zekâ asistanını kullan.",
-        "/login",
-        "Giriş Yap",
-        "Hesabın yok mu?",
-        "/register",
-        "Kayıt Ol",
-        error
+        content
     )
 
+
+# ============================================================
+# 22. ÇIKIŞ
+# ============================================================
 
 @app.route("/logout")
 def logout():
@@ -2097,7 +2213,8 @@ def logout():
         conn = db()
 
         conn.execute(
-            "DELETE FROM sessions WHERE token = ?",
+            "DELETE FROM sessions "
+            "WHERE token = ?",
             (token,)
         )
 
@@ -2115,9 +2232,9 @@ def logout():
     return response
 
 
-# =========================================================
-# 13. DASHBOARD
-# =========================================================
+# ============================================================
+# 23. DASHBOARD
+# ============================================================
 
 @app.route("/dashboard")
 @login_required
@@ -2129,108 +2246,87 @@ def dashboard():
 
     example_url = (
         f"{base_url}/api-key="
-        f"{user['api_key']}"
-        f"?word=merhaba"
+        f"{user['api_key']}?word=merhaba"
     )
 
     content = f"""
 
-    <main class="container">
+    <div class="container wide">
 
         <h1 class="page-title">
             Dashboard
         </h1>
 
-        <p class="subtitle">
+        <p class="subtitle"
+           style="font-size:15px">
+
             Hoş geldin,
             <strong style="color:white">
-                {user['username']}
+                {html.escape(user["username"])}
             </strong>.
-            Vantorium hesabını buradan yönetebilirsin.
+
+            Vantorium API'ni buradan yönetebilirsin.
+
         </p>
 
-
-        <section class="card">
+        <div class="card">
 
             <h3>
-                API Anahtarın
+                🔐 API Anahtarın
             </h3>
 
             <div class="api-key-box">
-                {user['api_key']}
+                {html.escape(user["api_key"])}
             </div>
 
             <p>
                 API anahtarını kimseyle paylaşma.
-                Gerekirse aşağıdaki butondan yenileyebilirsin.
             </p>
 
             <form
                 method="POST"
                 action="/regenerate-key"
+                style="margin-top:15px"
             >
 
                 <button
-                    class="small-danger"
                     type="submit"
+                    class="btn"
+                    style="
+                        background:#b52b35;
+                        max-width:190px;
+                    "
                 >
                     Anahtarı Yenile
                 </button>
 
             </form>
 
-        </section>
+        </div>
 
-
-        <section class="card">
+        <div class="card">
 
             <h3>
-                API Kullanımı
+                ⚡ API Kullanımı
             </h3>
 
             <p>
-                HTTP GET isteği göndererek Vantorium'u
-                uygulamalarında kullanabilirsin.
+                HTTP GET isteği gönder:
             </p>
 
             <div class="code-block">
-                {example_url}
+                {html.escape(example_url)}
             </div>
 
-            <p style="margin-top:12px">
-                Yanıt JSON olarak döner.
-            </p>
-
-        </section>
-
-
-        <section class="card">
-
-            <h3>
-                Hızlı Başlangıç
-            </h3>
-
             <p>
-                Sohbet ekranından Vantorium'a soru sorabilir,
-                sistemin gerektiğinde bilgi kaynağını
-                araştırmasını sağlayabilirsin.
+                JSON olarak
+                <code>"answer"</code>
+                alanından cevabı alabilirsin.
             </p>
 
-            <a
-                href="/chat"
-                class="main-btn"
-                style="
-                    display:flex;
-                    justify-content:center;
-                    margin-top:15px;
-                "
-            >
-                Sohbete Başla
-            </a>
+        </div>
 
-        </section>
-
-    </main>
+    </div>
 
     """
 
@@ -2241,9 +2337,9 @@ def dashboard():
     )
 
 
-# =========================================================
-# 14. CHAT
-# =========================================================
+# ============================================================
+# 24. CHAT
+# ============================================================
 
 @app.route("/chat")
 @login_required
@@ -2253,7 +2349,7 @@ def chat():
 
     content = """
 
-    <main class="chat-shell">
+    <div class="chat-layout">
 
         <div
             class="chat-history"
@@ -2267,39 +2363,38 @@ def chat():
                 </div>
 
                 <div class="msg-content">
-                    Selam! Ben Vantorium. Hazırım.
-                    Bir şey sor, gerektiğinde araştırıp
-                    en uygun cevabı hazırlayayım.
+
+                    Merhaba! Ben Vantorium.
+                    Sorunu gönder; gerekiyorsa
+                    web'de araştırıp en uygun
+                    kısa cevabı hazırlayayım.
+
                 </div>
 
             </div>
 
         </div>
 
+        <div class="chat-input-area">
 
-        <div class="chat-composer">
-
-            <div class="composer-box">
+            <div class="chat-input-box">
 
                 <input
-                    id="chatInput"
                     type="text"
+                    id="chatInput"
                     placeholder="Vantorium'a bir şey sor..."
                     autocomplete="off"
-                    maxlength="2000"
                 >
 
                 <button
                     id="sendBtn"
-                    class="send-btn"
-                    type="button"
                     onclick="sendChat()"
                     aria-label="Gönder"
                 >
 
                     <svg
-                        width="17"
-                        height="17"
+                        width="19"
+                        height="19"
                         viewBox="0 0 24 24"
                         fill="none"
                         stroke="currentColor"
@@ -2307,16 +2402,17 @@ def chat():
                         stroke-linecap="round"
                         stroke-linejoin="round"
                     >
+
                         <line
                             x1="12"
                             y1="19"
                             x2="12"
                             y2="5"
-                        ></line>
+                        />
 
                         <polyline
                             points="5 12 12 5 19 12"
-                        ></polyline>
+                        />
 
                     </svg>
 
@@ -2326,388 +2422,476 @@ def chat():
 
         </div>
 
-    </main>
+    </div>
 
 
-    <script>
+<script>
 
-    const historyBox =
-        document.getElementById("chatHistory");
+const chatHistory =
+    document.getElementById("chatHistory");
 
-    const input =
-        document.getElementById("chatInput");
+const chatInput =
+    document.getElementById("chatInput");
 
-    const sendButton =
-        document.getElementById("sendBtn");
-
-    let busy = false;
+const sendBtn =
+    document.getElementById("sendBtn");
 
 
-    function scrollBottom() {
+chatInput.addEventListener(
+    "keydown",
+    function(e) {
 
-        historyBox.scrollTo({
-            top: historyBox.scrollHeight,
-            behavior: "smooth"
-        });
+        if (
+            e.key === "Enter"
+            && !e.shiftKey
+        ) {
 
-    }
+            e.preventDefault();
 
-
-    function addMessage(text, type) {
-
-        const wrapper =
-            document.createElement("div");
-
-        wrapper.className =
-            "chat-msg " + type;
-
-
-        const avatar =
-            document.createElement("div");
-
-        avatar.className =
-            "avatar";
-
-        avatar.textContent =
-            type === "user" ? "K" : "V";
-
-
-        const message =
-            document.createElement("div");
-
-        message.className =
-            "msg-content";
-
-        // Güvenli:
-        // innerHTML yerine textContent.
-        message.textContent =
-            text;
-
-
-        wrapper.appendChild(avatar);
-        wrapper.appendChild(message);
-
-        historyBox.appendChild(wrapper);
-
-        scrollBottom();
-
-        return message;
-    }
-
-
-    function createThinkingMessage() {
-
-        const wrapper =
-            document.createElement("div");
-
-        wrapper.className =
-            "chat-msg ai";
-
-
-        const avatar =
-            document.createElement("div");
-
-        avatar.className =
-            "avatar";
-
-        avatar.textContent =
-            "V";
-
-
-        const content =
-            document.createElement("div");
-
-        content.className =
-            "msg-content";
-
-
-        content.innerHTML = `
-            <div class="thinking-box">
-
-                <div class="thinking-main">
-                    Düşünüyor...
-                </div>
-
-                <div class="thinking-status">
-
-                    <span class="loader"></span>
-
-                    <span id="thinkingStatus">
-                        Sorunu analiz ediyor...
-                    </span>
-
-                </div>
-
-            </div>
-        `;
-
-
-        wrapper.appendChild(avatar);
-        wrapper.appendChild(content);
-
-        historyBox.appendChild(wrapper);
-
-        scrollBottom();
-
-        return {
-            wrapper,
-            content
-        };
+            sendChat();
+        }
 
     }
+);
 
 
-    async function sendChat() {
-
-        if (busy)
-            return;
+chatInput.focus();
 
 
-        const text =
-            input.value.trim();
+function escapeHtml(text) {
+
+    const div =
+        document.createElement("div");
+
+    div.textContent =
+        text;
+
+    return div.innerHTML;
+}
 
 
-        if (!text)
-            return;
+function linkify(text) {
+
+    return text.replace(
+        /(https?:\\/\\/[^\\s]+)/g,
+        function(url) {
+
+            const safe =
+                escapeHtml(url);
+
+            return `
+                <a
+                    href="${safe}"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                >
+                    ${safe}
+                </a>
+            `;
+        }
+    );
+
+}
 
 
-        busy = true;
+function formatAnswer(text) {
 
-        sendButton.disabled = true;
+    let safe =
+        escapeHtml(text);
 
-        input.value = "";
-
-
-        addMessage(
-            text,
-            "user"
+    safe =
+        safe.replace(
+            /\\*\\*(.*?)\\*\\*/g,
+            "<strong>$1</strong>"
         );
 
+    safe =
+        linkify(safe);
 
-        const thinking =
-            createThinkingMessage();
+    return safe;
+}
 
 
-        try {
+function scrollBottom() {
 
-            const response =
-                await fetch(
-                    "/api/chat",
+    chatHistory.scrollTop =
+        chatHistory.scrollHeight;
+
+}
+
+
+function addMessage(
+    text,
+    sender
+) {
+
+    const div =
+        document.createElement("div");
+
+    div.className =
+        "chat-msg " + sender;
+
+    div.innerHTML = `
+
+        <div class="avatar">
+            ${sender === "user" ? "K" : "V"}
+        </div>
+
+        <div class="msg-content">
+            ${formatAnswer(text)}
+        </div>
+
+    `;
+
+    chatHistory.appendChild(
+        div
+    );
+
+    scrollBottom();
+
+    return div;
+}
+
+
+function addThinking() {
+
+    const div =
+        document.createElement("div");
+
+    div.className =
+        "chat-msg ai";
+
+    div.innerHTML = `
+
+        <div class="avatar">
+            V
+        </div>
+
+        <div
+            class="msg-content"
+            id="thinkingText"
+        >
+
+            <span class="thinking">
+
+                <span class="thinking-dot"></span>
+
+                <span>
+                    Düşünüyor...
+                </span>
+
+            </span>
+
+        </div>
+
+    `;
+
+    chatHistory.appendChild(
+        div
+    );
+
+    scrollBottom();
+
+    return div;
+}
+
+
+function updateThinking(
+    element,
+    text
+) {
+
+    const target =
+        element.querySelector(
+            "#thinkingText"
+        );
+
+    if (!target)
+        return;
+
+    target.innerHTML = `
+
+        <span class="thinking">
+
+            <span class="thinking-dot"></span>
+
+            <span>
+                ${escapeHtml(text)}
+            </span>
+
+        </span>
+
+    `;
+
+    scrollBottom();
+}
+
+
+function showImages(
+    parent,
+    images
+) {
+
+    if (
+        !images
+        || !images.length
+    ) {
+        return;
+    }
+
+    const grid =
+        document.createElement("div");
+
+    grid.className =
+        "image-grid";
+
+    images.forEach(
+        function(image) {
+
+            const card =
+                document.createElement("a");
+
+            card.className =
+                "image-card";
+
+            card.href =
+                image.url;
+
+            card.target =
+                "_blank";
+
+            card.rel =
+                "noopener noreferrer";
+
+            const img =
+                document.createElement("img");
+
+            img.src =
+                image.url;
+
+            img.loading =
+                "lazy";
+
+            img.alt =
+                image.title || "Görsel";
+
+            card.appendChild(
+                img
+            );
+
+            grid.appendChild(
+                card
+            );
+
+        }
+    );
+
+    parent.appendChild(
+        grid
+    );
+
+}
+
+
+async function sendChat() {
+
+    const text =
+        chatInput.value.trim();
+
+    if (!text)
+        return;
+
+    chatInput.value = "";
+
+    sendBtn.disabled = true;
+
+    addMessage(
+        text,
+        "user"
+    );
+
+    const thinking =
+        addThinking();
+
+    try {
+
+        const response =
+            await fetch(
+                "/api/chat",
+                {
+                    method: "POST",
+
+                    headers: {
+                        "Content-Type":
+                            "application/json"
+                    },
+
+                    body: JSON.stringify({
+                        message: text
+                    })
+                }
+            );
+
+        if (!response.ok) {
+            throw new Error(
+                "Sunucu hatası"
+            );
+        }
+
+        const reader =
+            response.body.getReader();
+
+        const decoder =
+            new TextDecoder();
+
+        let buffer = "";
+
+        while (true) {
+
+            const {
+                done,
+                value
+            } = await reader.read();
+
+            if (done)
+                break;
+
+            buffer +=
+                decoder.decode(
+                    value,
                     {
-                        method: "POST",
-
-                        headers: {
-                            "Content-Type":
-                                "application/json"
-                        },
-
-                        body: JSON.stringify({
-                            message: text
-                        })
+                        stream: true
                     }
                 );
 
+            const lines =
+                buffer.split("\\n");
 
-            if (!response.ok) {
+            buffer =
+                lines.pop();
 
-                throw new Error(
-                    "Server error"
-                );
+            for (
+                const line
+                of lines
+            ) {
 
-            }
+                if (!line.trim())
+                    continue;
 
+                try {
 
-            const reader =
-                response.body.getReader();
+                    const data =
+                        JSON.parse(line);
 
-            const decoder =
-                new TextDecoder();
+                    if (
+                        data.type
+                        === "status"
+                    ) {
 
+                        updateThinking(
+                            thinking,
+                            data.text
+                        );
 
-            let buffer = "";
+                    }
 
-            let answerStarted = false;
+                    if (
+                        data.type
+                        === "result"
+                    ) {
 
-            let answerElement = null;
+                        thinking.remove();
 
+                        const answerBox =
+                            addMessage(
+                                data.answer,
+                                "ai"
+                            );
 
-            while (true) {
+                        const content =
+                            answerBox.querySelector(
+                                ".msg-content"
+                            );
 
-                const result =
-                    await reader.read();
-
-
-                if (result.done)
-                    break;
-
-
-                buffer +=
-                    decoder.decode(
-                        result.value,
-                        {
-                            stream: true
-                        }
-                    );
-
-
-                const lines =
-                    buffer.split("\\n");
-
-                buffer =
-                    lines.pop();
-
-
-                for (const line of lines) {
-
-                    if (!line.trim())
-                        continue;
-
-
-                    try {
-
-                        const event =
-                            JSON.parse(line);
-
-
-                        if (event.type === "status") {
-
-                            const status =
-                                thinking.content
-                                    .querySelector(
-                                        "#thinkingStatus"
-                                    );
-
-                            const main =
-                                thinking.content
-                                    .querySelector(
-                                        ".thinking-main"
-                                    );
-
-
-                            if (status)
-                                status.textContent =
-                                    event.message;
-
-
-                            if (main)
-                                main.textContent =
-                                    event.title || "Düşünüyor...";
-
-
-                            scrollBottom();
-
-                        }
-
-
-                        else if (
-                            event.type === "answer"
+                        if (
+                            data.source
+                            && data.source !==
+                            "selamlama"
                         ) {
 
-                            if (!answerStarted) {
-
-                                thinking.wrapper.remove();
-
-                                answerElement =
-                                    addMessage(
-                                        "",
-                                        "ai"
-                                    );
-
-                                answerStarted = true;
-
-                            }
-
-
-                            answerElement.textContent +=
-                                event.text;
-
-
-                            scrollBottom();
-
-                        }
-
-
-                        else if (
-                            event.type === "done"
-                        ) {
-
-                            scrollBottom();
-
-                        }
-
-
-                        else if (
-                            event.type === "error"
-                        ) {
-
-                            if (!answerStarted) {
-
-                                thinking.wrapper.remove();
-
-                                addMessage(
-                                    event.message ||
-                                    "Bir hata oluştu.",
-                                    "ai"
+                            const source =
+                                document.createElement(
+                                    "div"
                                 );
 
-                            }
+                            source.className =
+                                "source";
+
+                            source.textContent =
+                                "Kaynak: "
+                                + data.source;
+
+                            content.appendChild(
+                                source
+                            );
 
                         }
 
-                    } catch (e) {
-                        // Bozuk stream parçasını atla.
+                        showImages(
+                            content,
+                            data.images || []
+                        );
+
                     }
+
+                    if (
+                        data.type
+                        === "error"
+                    ) {
+
+                        thinking.remove();
+
+                        addMessage(
+                            data.message
+                            || "Bir hata oluştu.",
+                            "ai"
+                        );
+
+                    }
+
+                } catch(e) {
+
+                    console.error(
+                        e
+                    );
 
                 }
 
             }
 
-
-        } catch (error) {
-
-            thinking.wrapper.remove();
-
-            addMessage(
-                "Bağlantı sırasında bir hata oluştu. Lütfen tekrar dene.",
-                "ai"
-            );
-
+            scrollBottom();
         }
 
+    } catch(error) {
 
-        busy = false;
+        thinking.remove();
 
-        sendButton.disabled = false;
-
-        input.focus();
+        addMessage(
+            "Bağlantı sırasında bir hata oluştu. Lütfen tekrar dene.",
+            "ai"
+        );
 
     }
 
+    sendBtn.disabled = false;
 
-    input.addEventListener(
-        "keydown",
-        function(event) {
+    chatInput.focus();
 
-            if (
-                event.key === "Enter"
-                && !event.shiftKey
-            ) {
+}
 
-                event.preventDefault();
+</script>
 
-                sendChat();
-
-            }
-
-        }
-    );
-
-
-    input.focus();
-
-    </script>
-
-    """
+"""
 
     return render_page(
         "Sohbet",
@@ -2716,11 +2900,14 @@ def chat():
     )
 
 
-# =========================================================
-# 15. STREAMING CHAT API
-# =========================================================
+# ============================================================
+# 25. STREAM API
+# ============================================================
 
-@app.route("/api/chat", methods=["POST"])
+@app.route(
+    "/api/chat",
+    methods=["POST"]
+)
 @login_required
 def api_chat():
 
@@ -2728,24 +2915,15 @@ def api_chat():
         silent=True
     ) or {}
 
-    message = str(
+    kelime = str(
         data.get("message", "")
     ).strip()
 
-
-    if not message:
-
+    if not kelime:
         return jsonify({
-            "error": "Mesaj boş olamaz."
+            "error":
+                "Mesaj boş olamaz."
         }), 400
-
-
-    if len(message) > 2000:
-
-        return jsonify({
-            "error": "Mesaj çok uzun."
-        }), 400
-
 
     def generate():
 
@@ -2754,199 +2932,70 @@ def api_chat():
             # 1
             yield json.dumps({
                 "type": "status",
-                "title": "Düşünüyor...",
-                "message": "Sorunu analiz ediyor..."
+                "text": "Düşünüyor..."
             }, ensure_ascii=False) + "\n"
 
-            time.sleep(.25)
+            time.sleep(.15)
 
+            parts =
+                analyze_query(kelime)
 
-            parts = analyze_query(
-                message
-            )
-
-
-            # Greeting / dataset / math
-            local_answer = None
-            local_source = None
-
-
-            if parts["is_greeting"]:
-
-                local_answer = random.choice([
-                    "Selam! Ben Vantorium. Hazırım, ne hakkında konuşalım?",
-                    "Merhaba! Vantorium hazır. Ne öğrenmek istersin?",
-                    "Selam kral! Sorunu gönder, birlikte bakalım."
-                ])
-
-                local_source = "selamlama"
-
-
-            elif parts["is_math"]:
-
-                try:
-
-                    result = safe_math(message)
-
-                    if (
-                        isinstance(result, float)
-                        and result.is_integer()
-                    ):
-                        result = int(result)
-
-                    local_answer = (
-                        f"Sonuç: {result}"
-                    )
-
-                    local_source = "matematik"
-
-                except Exception:
-
-                    local_answer = (
-                        "Bu matematik ifadesini "
-                        "çözemedim."
-                    )
-
-                    local_source = "hata"
-
-
-            elif (
-                normalize(message) in DATASET
-                and DATASET[
-                    normalize(message)
-                ]
+            # Basit cevaplarda gereksiz
+            # bekletme yapma
+            if (
+                parts["is_greeting"]
+                or parts["is_math"]
             ):
-
-                local_answer = random.choice(
-                    DATASET[
-                        normalize(message)
-                    ]
-                )
-
-                local_source = "veri_seti"
-
-
-            else:
-
-                cached = memory_get(
-                    normalize(message)
-                )
-
-                if cached:
-
-                    local_answer = cached
-                    local_source = "hafiza"
-
-
-            if local_answer is not None:
 
                 yield json.dumps({
                     "type": "status",
-                    "title": "Cevap hazırlanıyor...",
-                    "message": "Bildiklerimi kontrol ediyorum..."
+                    "text": "Cevabı hazırlıyor..."
                 }, ensure_ascii=False) + "\n"
-
-                time.sleep(.3)
-
 
             else:
 
                 # 2
                 yield json.dumps({
                     "type": "status",
-                    "title": "Web'de arıyor...",
-                    "message": (
-                        "Uygun bilgi kaynaklarını "
-                        "araştırıyorum..."
-                    )
+                    "text": "Web'de arıyor..."
                 }, ensure_ascii=False) + "\n"
 
-                time.sleep(.35)
-
-
-                results = search_web(
-                    message,
-                    parts
-                )
-
+                time.sleep(.2)
 
                 # 3
                 yield json.dumps({
                     "type": "status",
-                    "title": "Bulduğu bilgileri inceliyor...",
-                    "message": (
-                        f"{len(results)} kaynak "
-                        "değerlendiriliyor..."
-                    )
+                    "text":
+                        "Bulduğu bilgileri inceliyor..."
                 }, ensure_ascii=False) + "\n"
 
-                time.sleep(.35)
+                time.sleep(.2)
 
-
-                local_answer = build_normal_answer(
-                    message,
-                    results
-                )
-
-
-                local_source = (
-                    results[0].get(
-                        "source",
-                        "web"
-                    )
-                    if results
-                    else "bulunamadi"
-                )
-
-
-                if results:
-
-                    memory_save(
-                        normalize(message),
-                        local_answer,
-                        .85,
-                        local_source
-                    )
-
-
-            # 4
-            yield json.dumps({
-                "type": "status",
-                "title": "En uygun cevabı hazırlıyor...",
-                "message": "Bilgileri sade ve anlaşılır hale getiriyorum..."
-            }, ensure_ascii=False) + "\n"
-
-            time.sleep(.3)
-
-
-            # Answer stream
-            for char in local_answer:
-
+                # 4
                 yield json.dumps({
-                    "type": "answer",
-                    "text": char
+                    "type": "status",
+                    "text":
+                        "En uygun cevabı hazırlıyor..."
                 }, ensure_ascii=False) + "\n"
 
-                # hızlı ama akıcı
-                time.sleep(.006)
-
+            answer, source, images = get_answer(
+                kelime
+            )
 
             yield json.dumps({
-                "type": "done",
-                "source": local_source
+                "type": "result",
+                "answer": answer,
+                "source": source,
+                "images": images
             }, ensure_ascii=False) + "\n"
 
-
-        except Exception as error:
+        except Exception as e:
 
             yield json.dumps({
                 "type": "error",
-                "message": (
-                    "Cevap oluşturulurken "
-                    "bir hata oluştu."
-                )
+                "message":
+                    "Cevap hazırlanırken hata oluştu."
             }, ensure_ascii=False) + "\n"
-
 
     return Response(
         generate(),
@@ -2958,9 +3007,9 @@ def api_chat():
     )
 
 
-# =========================================================
-# 16. API KEY REGENERATE
-# =========================================================
+# ============================================================
+# 26. API KEY YENİLE
+# ============================================================
 
 @app.route(
     "/regenerate-key",
@@ -2979,19 +3028,25 @@ def regenerate_key():
     conn = db()
 
     conn.execute(
-        "UPDATE users SET api_key = ? WHERE id = ?",
-        (new_key, user["id"])
+        "UPDATE users SET api_key = ? "
+        "WHERE id = ?",
+        (
+            new_key,
+            user["id"]
+        )
     )
 
     conn.commit()
     conn.close()
 
-    return redirect("/dashboard")
+    return redirect(
+        "/dashboard"
+    )
 
 
-# =========================================================
-# 17. INFO
-# =========================================================
+# ============================================================
+# 27. BİLGİ / KURALLAR
+# ============================================================
 
 @app.route("/info")
 def info():
@@ -3002,125 +3057,120 @@ def info():
 
     content = f"""
 
-    <main class="container">
+    <div class="container wide">
 
         <h1 class="page-title">
-            Bilgi Merkezi
+            Vantorium Bilgi Merkezi
         </h1>
 
-        <p class="subtitle">
-            Vantorium'u kullanmadan önce bilmen gerekenler.
+        <p class="subtitle"
+           style="font-size:15px">
+
+            Vantorium API, kullanım kuralları
+            ve gizlilik bilgileri.
+
         </p>
 
+        <div class="card">
 
-        <section class="info-card">
-
-            <h2>
-                Vantorium Nedir?
-            </h2>
+            <h3>
+                🤖 Vantorium Nedir?
+            </h3>
 
             <p>
-                Vantorium, soruları analiz eden,
-                gerektiğinde bilgi kaynaklarını araştıran
-                ve bulunan bilgileri kullanıcıya daha
-                anlaşılır şekilde sunmayı amaçlayan
-                yapay zekâ asistanıdır.
+                Vantorium, kullanıcı sorularını
+                analiz eden ve gerektiğinde web
+                kaynaklarından bilgi araştırarak
+                cevaplayan bir yapay zekâ
+                asistanıdır.
             </p>
 
-        </section>
+        </div>
 
+        <h2 class="section-title">
+            API Kullanımı
+        </h2>
 
-        <section class="info-card">
-
-            <h2>
-                API Kullanımı
-            </h2>
+        <div class="card">
 
             <p>
-                API anahtarını kullanarak şu şekilde
-                istek gönderebilirsin:
+                API anahtarınla istek gönderebilirsin:
             </p>
 
             <div class="code-block">
-                {base_url}/api-key=SENIN_API_KEY?word=merhaba
+                {html.escape(base_url)}
+                /api-key=SENIN_ANAHTARIN?word=merhaba
             </div>
 
-        </section>
-
-
-        <section class="info-card">
-
-            <h2>
-                Kurallar
-            </h2>
-
-            <ul>
-
-                <li>
-                    API anahtarını başkalarıyla paylaşma.
-                </li>
-
-                <li>
-                    Sistemi aşırı isteklerle yavaşlatmaya
-                    veya hizmet dışı bırakmaya çalışma.
-                </li>
-
-                <li>
-                    Yasa dışı amaçlarla kullanma.
-                </li>
-
-                <li>
-                    Vantorium'un verdiği bilgileri kritik
-                    konularda ayrıca doğrula.
-                </li>
-
-                <li>
-                    Sistemin açıklarını kötüye kullanma.
-                </li>
-
-            </ul>
-
-        </section>
-
-
-        <section class="info-card">
-
-            <h2>
-                Gizlilik
-            </h2>
-
             <p>
-                Hesap sistemi kullanıcı adı, parola özeti
-                ve API anahtarı gibi hesap verilerini
-                yönetmek için SQLite kullanır.
-                Sohbet cevapları gerektiğinde sistemin
-                hafıza mekanizmasında saklanabilir.
+                API JSON formatında cevap verir.
             </p>
 
-        </section>
+        </div>
 
+        <h2 class="section-title">
+            Kurallar
+        </h2>
 
-        <section class="info-card">
-
-            <h2>
-                Sorumluluk Reddi
-            </h2>
+        <div class="card">
 
             <p>
-                Vantorium tarafından verilen cevaplar
-                bilgilendirme amaçlıdır. Özellikle tıbbi,
-                hukuki ve finansal konularda profesyonel
+                • API anahtarını paylaşma.<br><br>
+
+                • Sistemi aşırı isteklerle
+                zorlamaya çalışma.<br><br>
+
+                • DDoS, SQL Injection,
+                XSS ve benzeri saldırılar
+                yasaktır.<br><br>
+
+                • Yasa dışı faaliyetler için
+                kullanma.<br><br>
+
+                • Vantorium cevaplarının
+                her zaman %100 doğru olduğu
+                garanti edilmez.
+            </p>
+
+        </div>
+
+        <h2 class="section-title">
+            Gizlilik
+        </h2>
+
+        <div class="card">
+
+            <p>
+                Hesap işlemleri için kullanıcı adı,
+                şifre özeti ve API anahtarı tutulur.
+                Sistem performansı ve cevap kalitesi
+                için bazı sorgular anonim şekilde
+                hafızaya alınabilir.
+            </p>
+
+        </div>
+
+        <h2 class="section-title">
+            Sorumluluk Reddi
+        </h2>
+
+        <div class="card">
+
+            <p>
+                Vantorium tarafından oluşturulan
+                cevaplar bilgilendirme amacıyla
+                sunulur. Kritik tıbbi, hukuki veya
+                finansal kararlar için bağımsız
                 doğrulama yapılmalıdır.
             </p>
 
-        </section>
-
+        </div>
 
         <div class="footer">
             © 2026 Vantorium AI
         </div>
 
-    </main>
+    </div>
 
     """
 
@@ -3131,9 +3181,9 @@ def info():
     )
 
 
-# =========================================================
-# 18. EXTERNAL API
-# =========================================================
+# ============================================================
+# 28. DIŞ API
+# ============================================================
 
 @app.route(
     "/api-key=<apikey>",
@@ -3146,70 +3196,71 @@ def api_word(apikey):
         ""
     ).strip()
 
-
     if not word:
 
         return jsonify({
-            "error": "word parametresi gerekli",
-            "usage": "/api-key=...?word=kelime"
-        }), 400
+            "error":
+                "word parametresi gerekli",
 
+            "usage":
+                "/api-key=...?word=kelime"
+        }), 400
 
     conn = db()
 
     user = conn.execute(
-        "SELECT * FROM users WHERE api_key = ?",
+        "SELECT * FROM users "
+        "WHERE api_key = ?",
         (apikey,)
     ).fetchone()
 
     conn.close()
 
-
     if not user:
 
         return jsonify({
-            "error": "Geçersiz API anahtarı"
+            "error":
+                "Geçersiz API anahtarı"
         }), 401
-
 
     start = time.time()
 
-
-    answer, source = get_answer(
+    answer, source, images = get_answer(
         word
     )
 
-
     return jsonify({
-
         "input": word,
 
         "answer": answer,
+
+        "images": images,
 
         "meta": {
 
             "source": source,
 
-            "time_ms": round(
-                (time.time() - start) * 1000,
-                2
-            ),
+            "time_ms":
+                round(
+                    (time.time() - start)
+                    * 1000,
+                    2
+                ),
 
-            "engine": "Vantorium v5",
+            "engine":
+                "Vantorium Pro",
 
             "timestamp":
                 datetime.now()
                 .astimezone()
                 .isoformat()
-
         }
-
     })
 
 
-# =========================================================
-# 19. RUN
-# =========================================================
+# ============================================================
+# 29. ÇALIŞTIR
+# ============================================================
 
 if __name__ == "__main__":
 
@@ -3222,6 +3273,5 @@ if __name__ == "__main__":
 
     app.run(
         host="0.0.0.0",
-        port=port,
-        threaded=True
+        port=port
     )
