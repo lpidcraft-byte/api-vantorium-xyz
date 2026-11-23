@@ -11,59 +11,168 @@ import hashlib
 import html
 import ast
 import operator
-from datetime import datetime
+import tempfile
+import uuid
+from datetime import datetime, timedelta
 from functools import wraps
-from flask import Flask, request, jsonify, Response, redirect, make_response, render_template_string
+from contextlib import contextmanager
+from collections import defaultdict, deque
+from threading import Lock
+from flask import Flask, request, jsonify, Response, redirect, make_response, render_template_string, session, send_from_directory, send_file, g
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
+app.secret_key = os.environ.get("AgHa3uhKwpLmnw!jduUs", secrets.token_hex(32))
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=30)
 
-DB_FILE = "vantorium.db"
+# =========================================================
+# DATABASE — Kalıcı ve güvenilir SQLite
+# =========================================================
+
+def _resolve_db_path():
+    """
+    Railway / Docker / yerel ortamda kalıcı DB yolu seçer.
+    Öncelik:
+      1. DB_PATH ortam değişkeni
+      2. /data/vantorium.db  (volume mount için)
+      3. uygulamanın yanındaki data/ klasörü
+    """
+    env_path = os.environ.get("DB_PATH", "").strip()
+    if env_path:
+        return env_path
+
+    # Railway / Docker volume için yaygın yol
+    for candidate in ("/data/vantorium.db", "/app/data/vantorium.db"):
+        parent = os.path.dirname(candidate)
+        if os.path.isdir(parent) or os.access(os.path.dirname(parent) or "/", os.W_OK):
+            try:
+                os.makedirs(parent, exist_ok=True)
+                return candidate
+            except Exception:
+                pass
+
+    # Yerel / fallback
+    base = os.path.dirname(os.path.abspath(__file__))
+    data_dir = os.path.join(base, "data")
+    try:
+        os.makedirs(data_dir, exist_ok=True)
+    except Exception:
+        data_dir = tempfile.gettempdir()
+    return os.path.join(data_dir, "vantorium.db")
+
+
+DB_FILE = _resolve_db_path()
 GOOGLE_CX = os.environ.get("GOOGLE_CX", "f79f63e39ec7f4c78")
+CODE_FILES_DIR = os.path.join(os.path.dirname(DB_FILE), "code_files")
+try:
+    os.makedirs(CODE_FILES_DIR, exist_ok=True)
+except Exception:
+    CODE_FILES_DIR = tempfile.mkdtemp(prefix="vantorium_code_")
 
-# =========================================================
-# DATABASE
-# =========================================================
 
 def db():
-    conn = sqlite3.connect(DB_FILE, timeout=20)
+    """Her çağrıda yeni bağlantı; WAL + timeout ile güvenli."""
+    conn = sqlite3.connect(DB_FILE, timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=30000")
     return conn
 
-def init_db():
-    conn = db()
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            api_key TEXT UNIQUE NOT NULL,
-            created_at TEXT
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS memory (
-            word TEXT PRIMARY KEY,
-            answer TEXT,
-            confidence REAL,
-            source TEXT,
-            created_at TEXT
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS sessions (
-            token TEXT PRIMARY KEY,
-            user_id INTEGER,
-            created_at TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
 
+@contextmanager
+def db_cursor():
+    """Context manager — bağlantı sızıntısını önler."""
+    conn = db()
+    try:
+        cur = conn.cursor()
+        yield cur
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def init_db():
+    """Tabloları oluşturur, gerekirse eksik kolonları ekler. Birden fazla çağrı güvenli."""
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            with db_cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        username TEXT UNIQUE NOT NULL,
+                        password_hash TEXT NOT NULL,
+                        api_key TEXT UNIQUE NOT NULL,
+                        created_at TEXT NOT NULL,
+                        last_login TEXT,
+                        is_active INTEGER DEFAULT 1
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS memory (
+                        word TEXT PRIMARY KEY,
+                        answer TEXT,
+                        confidence REAL,
+                        source TEXT,
+                        created_at TEXT
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS sessions (
+                        token TEXT PRIMARY KEY,
+                        user_id INTEGER NOT NULL,
+                        created_at TEXT NOT NULL,
+                        expires_at TEXT,
+                        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS code_files (
+                        id TEXT PRIMARY KEY,
+                        user_id INTEGER,
+                        filename TEXT NOT NULL,
+                        language TEXT,
+                        content TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        expires_at TEXT,
+                        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS rate_events (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        ip TEXT NOT NULL,
+                        endpoint TEXT,
+                        created_at REAL NOT NULL
+                    )
+                """)
+                # İndeksler
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_code_files_user ON code_files(user_id)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_rate_ip ON rate_events(ip, created_at)")
+            print(f"[Vantorium] SQLite hazır → {DB_FILE}")
+            return
+        except sqlite3.OperationalError as e:
+            if attempt < max_retries - 1:
+                time.sleep(0.3 * (attempt + 1))
+                continue
+            raise RuntimeError(f"Veritabanı başlatılamadı ({DB_FILE}): {e}") from e
+
+
+# Uygulama başlarken mutlaka çalıştır
 init_db()
+
 
 def hash_password(password):
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
 
 def normalize(text):
     text = (text or "").lower().strip()
@@ -71,23 +180,87 @@ def normalize(text):
     text = re.sub(r"[?!.,;:]+$", "", text)
     return text
 
+
 def memory_get(word):
-    conn = db()
-    row = conn.execute(
-        "SELECT answer FROM memory WHERE word = ?", (word,)
-    ).fetchone()
-    conn.close()
-    return row["answer"] if row else None
+    try:
+        with db_cursor() as cur:
+            row = cur.execute(
+                "SELECT answer FROM memory WHERE word = ?", (word,)
+            ).fetchone()
+            return row["answer"] if row else None
+    except Exception:
+        return None
+
 
 def memory_save(word, answer, confidence, source):
-    conn = db()
-    conn.execute("""
-        INSERT OR REPLACE INTO memory
-        (word, answer, confidence, source, created_at)
-        VALUES (?, ?, ?, ?, ?)
-    """, (word, answer, confidence, source, datetime.now().isoformat()))
-    conn.commit()
-    conn.close()
+    try:
+        with db_cursor() as cur:
+            cur.execute("""
+                INSERT OR REPLACE INTO memory
+                (word, answer, confidence, source, created_at)
+                VALUES (?, ?, ?, ?, ?)
+            """, (word, answer, confidence, source, datetime.now().isoformat()))
+    except Exception as e:
+        print(f"[memory_save] hata: {e}")
+
+
+def save_code_file(content, language, filename=None, user_id=None, ttl_hours=48):
+    """Uzun kodları geçici dosya olarak saklar, indirme ID'si döner."""
+    file_id = secrets.token_urlsafe(16)
+    ext_map = {
+        "python": ".py", "html": ".html", "css": ".css",
+        "javascript": ".js", "php": ".php", "java": ".java",
+        "csharp": ".cs", "cpp": ".cpp", "sql": ".sql",
+        "bash": ".sh", "typescript": ".ts", "go": ".go",
+        "rust": ".rs", "ruby": ".rb", "swift": ".swift",
+    }
+    ext = ext_map.get(language, ".txt")
+    if not filename:
+        filename = f"vantorium_{language}_{file_id[:8]}{ext}"
+    elif not filename.endswith(ext):
+        filename = filename + ext
+
+    expires = (datetime.now() + timedelta(hours=ttl_hours)).isoformat()
+    try:
+        with db_cursor() as cur:
+            cur.execute("""
+                INSERT INTO code_files (id, user_id, filename, language, content, created_at, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (file_id, user_id, filename, language, content, datetime.now().isoformat(), expires))
+        return file_id, filename
+    except Exception as e:
+        print(f"[save_code_file] hata: {e}")
+        return None, None
+
+
+def get_code_file(file_id):
+    try:
+        with db_cursor() as cur:
+            row = cur.execute(
+                "SELECT * FROM code_files WHERE id = ?", (file_id,)
+            ).fetchone()
+            if not row:
+                return None
+            if row["expires_at"] and row["expires_at"] < datetime.now().isoformat():
+                cur.execute("DELETE FROM code_files WHERE id = ?", (file_id,))
+                return None
+            return dict(row)
+    except Exception:
+        return None
+
+
+def cleanup_expired():
+    """Eski oturum ve kod dosyalarını temizler."""
+    try:
+        now = datetime.now().isoformat()
+        with db_cursor() as cur:
+            cur.execute("DELETE FROM sessions WHERE expires_at IS NOT NULL AND expires_at < ?", (now,))
+            cur.execute("DELETE FROM code_files WHERE expires_at IS NOT NULL AND expires_at < ?", (now,))
+            # 7 günden eski rate kayıtlarını sil
+            cutoff = time.time() - 7 * 86400
+            cur.execute("DELETE FROM rate_events WHERE created_at < ?", (cutoff,))
+    except Exception as e:
+        print(f"[cleanup] hata: {e}")
 
 # =========================================================
 # DATASET
@@ -175,6 +348,11 @@ def analyze_query(query):
         "is_code_request": is_code_request(query),
         "is_definition": bool(DEFINITION_RE.match(query or "")),
         "is_response_advice": bool(RESPONSE_RE.search(query or "")),
+        "is_recommendation": bool(re.search(
+            r"\b(öner|önerir misin|tavsiye et|fikir ver|konu öner|"
+            r"kaç tane.*öner|\d+.*(konu|fikir|teknoloji).*(öner|listele))\b",
+            q, re.I
+        )),
     }
 
 # =========================================================
@@ -743,17 +921,77 @@ if __name__ == "__main__":
     main()
 '''
 
-def code_response(query):
+def _format_code_answer(code, language, title="Kod", source="uretilen_kod", user_id=None):
+    """
+    Kod 40 KB'dan büyükse dosya olarak saklar ve indirme linki verir.
+    Küçükse normal markdown code block döner.
+    """
+    code = code or ""
+    size = len(code.encode("utf-8"))
+    FILE_THRESHOLD = 40 * 1024  # 40 KB
+
+    if size >= FILE_THRESHOLD:
+        file_id, filename = save_code_file(code, language, user_id=user_id)
+        if file_id:
+            return (
+                f"**{title}**\n\n"
+                f"Kod {size // 1024} KB olduğu için dosya olarak hazırladım.\n\n"
+                f"📥 **İndir:** [{filename}](/download/code/{file_id})\n\n"
+                f"Dosya 48 saat boyunca geçerli. İndirdikten sonra bilgisayarında açabilirsin.",
+                source + "_dosya"
+            )
+        # fallback: yine de kısaltılmış göster
+        preview = code[:8000] + "\n\n# ... (dosya çok büyük, tamamı kaydedilemedi) ..."
+        return (f"**{title}**\n\n```{language}\n{preview}\n```", source)
+
+    return (
+        f"**{title}**\n\n```{language}\n{code}\n```",
+        source
+    )
+
+
+def code_response(query, user_id=None):
     language = detect_code_language(query)
     if DANGEROUS_CODE_RE.search(query):
-        return ("Bu istek saldırı/zararlı yazılım koduna giriyorsa onu GitHub'dan çekip veremem. Kendi sistemini test ediyorsan güvenli bir yük testi veya laboratuvar örneği hazırlayabilirim.", "guvenlik")
+        return (
+            "Bu istek saldırı/zararlı yazılım koduna giriyorsa onu GitHub'dan çekip veremem. "
+            "Kendi sistemini test ediyorsan güvenli bir yük testi veya laboratuvar örneği hazırlayabilirim.",
+            "guvenlik"
+        )
     subject = code_request_subject(query)
     candidates = github_repo_code_search(subject, language)
     if candidates:
         best = candidates[0]
-        return (f"İstediğin koda uygun bir GitHub örneği buldum.\n\nDosya: {best.get('title', 'GitHub')}\n\n```{language}\n{best['code']}\n```", "github_kod")
+        title = f"GitHub örneği — {best.get('title', 'repo')}"
+        return _format_code_answer(best["code"], language, title=title, source="github_kod", user_id=user_id)
+
     generated = generate_code_fallback(query, language)
-    return (f"GitHub'da doğrudan uygun bir örnek bulamadım. İstediğin şeye uygun bir başlangıç kodu oluşturdum.\n\n```{language}\n{generated}\n```", "uretilen_kod")
+    return _format_code_answer(
+        generated, language,
+        title="Başlangıç kodu (yerel üretildi)",
+        source="uretilen_kod",
+        user_id=user_id
+    )
+
+
+# =========================================================
+# GENERATIVE AI — REAL ANSWER SYNTHESIS
+# =========================================================
+
+def call_language_model(user_prompt, context="", mode="answer"):
+    """Harici LLM bağlantısı kapalıdır; Vantorium yerel motorunu kullanır."""
+    return None
+
+
+def format_research_context(results):
+    chunks = []
+    for item in (results or [])[:7]:
+        title = clean_snippet(item.get("title", ""), 180)
+        snippet = clean_snippet(item.get("snippet", ""), 650)
+        if title or snippet:
+            chunks.append((title + ": " + snippet).strip())
+    return "\n\n".join(chunks)
+
 
 # =========================================================
 # SMART ANSWER
@@ -802,23 +1040,46 @@ def clean_snippet(text, max_len=420):
     return text
 
 def synthesize_answer(query, results, parts):
+    """Ham arama metinlerini yerel kurallarla kısa, çok kaynaklı özete dönüştürür."""
     if not results:
         return None
-    results = best_results(results, make_search_query(query, parts), 6)
+    ranked = best_results(results, make_search_query(query, parts), 8)
     target = extract_target(query, parts)
-    if parts["is_definition"]:
-        for result in results:
-            snippet = clean_snippet(result.get("snippet", ""), 650)
-            if snippet:
-                return f"{target} şu anlama gelir: {snippet}"
-    if parts["is_response_advice"]:
-        for result in results:
-            snippet = clean_snippet(result.get("snippet", ""), 420)
-            if snippet:
-                return f"{target} ifadesine verilebilecek en uygun kısa cevap: {snippet}"
-    first = results[0]
-    snippet = clean_snippet(first.get("snippet", ""), 700)
-    return snippet or "Arama sonucu bulundu ama okunabilir bir açıklama alınamadı."
+    snippets, seen = [], set()
+    for item in ranked:
+        snippet = clean_snippet(item.get("snippet", ""), 520)
+        if not snippet or normalize(snippet) in seen:
+            continue
+        seen.add(normalize(snippet))
+        snippets.append(snippet)
+        if len(snippets) >= 4:
+            break
+    if not snippets:
+        return None
+    if parts.get("is_definition"):
+        return f"**{target}**: {snippets[0]}"
+    if parts.get("is_response_advice"):
+        return (
+            "Bu ifadeye verebileceğin kısa cevap: **“Anladım, biraz daha açar mısın?”**\\n\\n"
+            "Daha samimi bir seçenek: **“Neden öyle düşünüyorsun?”**\\n\\n"
+            f"Arama sonuçlarından ilgili bilgi: {snippets[0]}"
+        )
+    sentences = []
+    for snippet in snippets:
+        for sentence in re.split(r"(?<=[.!?])\\s+", snippet):
+            sentence = sentence.strip(" -•")
+            if len(sentence) >= 35 and normalize(sentence) not in {normalize(x) for x in sentences}:
+                sentences.append(sentence)
+            if len(sentences) >= 4:
+                break
+        if len(sentences) >= 4:
+            break
+    if not sentences:
+        sentences = snippets[:2]
+    return (
+        f"**{query.strip()}** hakkında bulabildiğim bilgilerin özeti:\\n\\n"
+        + "\\n\\n".join(sentences[:4])
+    )
 
 def search_everywhere(query, parts=None):
     if parts is None:
@@ -827,62 +1088,271 @@ def search_everywhere(query, parts=None):
     google_results = cse_search(search_query, "web", 6)
     wiki_results = wikipedia_search(search_query, 3)
     github_results = github_search(search_query, 5) if parts.get("is_code") else []
-    return best_results(google_results + github_results + wiki_results, search_query, 8)
+    results = best_results(google_results + github_results + wiki_results, search_query, 8)
+    query_terms = [w for w in normalize(search_query).split() if len(w) >= 3]
+    relevant = []
+    for item in results:
+        haystack = normalize(item.get("title", "") + " " + item.get("snippet", ""))
+        matched = sum(1 for word in query_terms if word in haystack)
+        if not query_terms or matched >= min(2, len(query_terms)):
+            relevant.append(item)
+    return relevant
+
+
+# =========================================================
+# LOCAL GENERATION ENGINE — NO AI API REQUIRED
+# =========================================================
+
+LOCAL_KNOWLEDGE = {
+    "python": "Python; okunabilir sözdizimiyle öne çıkan, otomasyon, web geliştirme, veri analizi ve yazılım projelerinde kullanılan genel amaçlı bir programlama dilidir.",
+    "html": "HTML, web sayfalarının başlık, paragraf, görsel, bağlantı ve form gibi yapısal öğelerini tanımlayan işaretleme dilidir. Tek başına programlama dili değildir.",
+    "css": "CSS, HTML ile oluşturulan web sayfalarının renk, yerleşim, tipografi, animasyon ve farklı ekranlara uyum gibi görsel özelliklerini belirler.",
+    "javascript": "JavaScript, web sayfalarına etkileşim kazandıran ve tarayıcıda veya Node.js gibi ortamlarda çalışabilen programlama dilidir.",
+    "api": "API, farklı yazılımların belirli kurallar üzerinden birbiriyle veri alışverişi yapmasını ve işlevlerini kullanmasını sağlayan arayüzdür.",
+    "yapay zeka": "Yapay zekâ, bilgisayar sistemlerinin dil anlama, örüntü bulma, tahmin ve karar desteği gibi görevleri yerine getirmesini sağlayan yöntemler bütünüdür.",
+    "algoritma": "Algoritma, bir problemi çözmek veya bir işi tamamlamak için izlenen açık ve sıralı adımlar bütünüdür.",
+    "internet": "İnternet, dünya genelindeki bilgisayar ağlarını ortak iletişim kurallarıyla birbirine bağlayan küresel ağ sistemidir.",
+    "veritabanı": "Veritabanı, bilgilerin düzenli biçimde saklanmasını, aranmasını, güncellenmesini ve yönetilmesini sağlayan sistemdir.",
+    "ddos": "DDoS, bir hizmeti çok sayıda kaynaktan gelen yoğun trafikle erişilemez hâle getirmeyi amaçlayan dağıtık hizmet engelleme saldırısıdır. Savunmada trafik filtreleme, hız sınırı, CDN ve sağlayıcı koruması kullanılır.",
+    "makine öğrenmesi": "Makine öğrenmesi, bilgisayarların verilerdeki örüntülerden model oluşturmasını sağlayan yapay zekâ alanıdır."
+}
+
+WORD_SYLLABLES = (
+    "va", "ven", "tor", "ium", "zi", "ra", "lun", "tek", "no", "mir",
+    "ka", "ro", "zen", "ari", "sol", "nev", "ora", "dex", "el", "on"
+)
+
+def generate_original_words(count=10, short=False):
+    count = max(1, min(int(count), 20))
+    words = set()
+    attempts = 0
+    while len(words) < count and attempts < count * 40:
+        attempts += 1
+        word = "".join(random.choice(WORD_SYLLABLES) for _ in range(random.choice((2, 2, 3))))
+        if short:
+            word = word[:random.choice((4, 5, 6))]
+        word = word.capitalize()
+        if 4 <= len(word) <= 12:
+            words.add(word)
+    return list(words)
+
+def local_creative_answer(query):
+    q = normalize(query)
+    count_match = re.search(r"\b(\d{1,2})\b", q)
+    count = min(20, max(1, int(count_match.group(1)))) if count_match else 8
+
+    if re.search(r"\b(kelime|kelimeler|uydurma kelime)\b", q) and re.search(r"\b(üret|oluştur|bul|ver|yaz)\b", q):
+        words = generate_original_words(count, short=True)
+        return (
+            "İşte yerel kelime üreticimin oluşturduğu özgün kelimeler:\n\n"
+            + " · ".join(words)
+            + "\n\nBunlar sözlük kelimesi değil; hece birleştirmesiyle oluşturulmuş yeni isim fikirleridir."
+        ), "yerel_uretim"
+
+    if re.search(r"\b(nick|kullanıcı adı|username|oyuncu adı)\b", q):
+        words = generate_original_words(count, short=True)
+        return "Kullanıcı adı önerileri:\n\n" + "\n".join(
+            f"{i+1}. **{w}**" for i, w in enumerate(words)
+        ), "yerel_uretim"
+
+    if re.search(r"\b(isim|marka adı|proje adı|uygulama adı)\b", q):
+        words = generate_original_words(count)
+        return "İsim fikirleri:\n\n" + "\n".join(
+            f"{i+1}. **{w}**" for i, w in enumerate(words)
+        ), "yerel_uretim"
+
+    if re.search(r"\b(slogan|motto)\b", q):
+        options = [
+            "Fikrini gerçeğe dönüştür.",
+            "Küçük başla, büyük düşün.",
+            "Gelecek, bugün attığın adımla başlar.",
+            "Sınırları değil, olasılıkları keşfet.",
+            "Her fikrin güçlü bir başlangıcı vardır.",
+            "Üret, dene, geliştir, yeniden keşfet."
+        ]
+        random.shuffle(options)
+        return "Slogan önerileri:\n\n" + "\n".join(
+            f"{i+1}. {item}" for i, item in enumerate(options[:count])
+        ), "yerel_uretim"
+
+    if re.search(r"\b(fikir|proje fikri|uygulama fikri)\b", q) and re.search(r"\b(üret|öner|ver|bul|oluştur)\b", q):
+        ideas = [
+            "Notları etiketleyip aranabilir hâle getiren kişisel arşiv.",
+            "Günlük harcamaları çevrimdışı takip eden bütçe uygulaması.",
+            "Dosyaları tür ve tarihe göre düzenleyen masaüstü aracı.",
+            "Kelime öğrenmek için aralıklı tekrar kartları.",
+            "Web sitelerinin erişilebilirliğini kontrol eden denetleyici.",
+            "Kod parçacıklarını etiketleyip arayan kişisel kütüphane.",
+            "Alışkanlıkları takvim üzerinde takip eden günlük uygulama.",
+            "Uzun metinleri başlık ve maddelere ayıran düzenleyici.",
+            "Yerel ağdaki cihazları listeleyen yönetim paneli.",
+            "Kişisel görevleri önceliğe göre sıralayan mini planlayıcı."
+        ]
+        random.shuffle(ideas)
+        return "Proje fikirleri:\n\n" + "\n".join(
+            f"{i+1}. {item}" for i, item in enumerate(ideas[:count])
+        ), "yerel_uretim"
+
+    return None
+
+def local_knowledge_answer(query):
+    q = normalize(query)
+    for key, answer in LOCAL_KNOWLEDGE.items():
+        if key in q:
+            return answer
+    return None
+
+def local_fallback_answer(query):
+    q = (query or "").strip()
+    if len(q.split()) <= 2:
+        return (
+            f"“{q}” hakkında hangi yönden bilgi istediğini biraz açar mısın? "
+            "Anlamını, kullanımını, örneklerini veya nasıl yapılacağını açıklayabilirim."
+        )
+    return (
+        "Bu soruya özel doğrulanmış bilgi yerel bilgi tabanımda bulunmuyor. "
+        "Arama sonuçları da yeterince ilgili değil; yanlış bilgi uydurmak istemem. "
+        "Soruyu biraz daha ayrıntılandırırsan yerel bilgilerim ve örneklerle yardımcı olabilirim."
+    )
+
+
+def recommendation_answer(query):
+    q = normalize(query)
+    if re.search(r"teknoloji|technology|teknolojik", q):
+        return (
+            "Bugün öğrenmeye değer 5 teknoloji konusu:\\n\\n"
+            "1. **Yapay zekâ ajanları:** Araç kullanabilen ve çok adımlı işleri "
+            "tamamlayabilen akıllı sistemler.\\n\\n"
+            "2. **Siber güvenlik:** Kimlik avı, veri sızıntısı ve güvenli yazılım "
+            "geliştirme yöntemleri.\\n\\n"
+            "3. **Kuantum bilişim:** Kuantum bilgisayarların çalışma mantığı "
+            "ve kullanım alanları.\\n\\n"
+            "4. **Robotik ve otonom sistemler:** Sensörler, bilgisayarlı görü "
+            "ve kendi kararlarını verebilen makineler.\\n\\n"
+            "5. **Edge AI:** Yapay zekânın bulut yerine telefon ve diğer "
+            "cihazların üzerinde çalıştırılması.\\n\\n"
+            "**Başlangıç önerim:** Python temeliyle küçük bir yapay zekâ "
+            "asistanı geliştirerek başla.",
+            "öneri"
+        )
+    return None
+
 
 def get_answer(query):
     query = (query or "").strip()
     if not query:
         return "Bir şeyler yaz, birlikte bakalım.", "sistem"
+
     parts = analyze_query(query)
+
     if parts["is_greeting"]:
         return random.choice([
-            "Selam! 👋 Ben Vantorium. Ne arıyoruz?",
-            "Merhaba! Hazırım. Sorunu yaz, araştırıp en uygun cevabı vereyim.",
-            "Selam kral 😎 Ne hakkında araştırma yapalım?"
+            "Selam! 👋 Ben Vantorium. Ne yapmak istiyorsun?",
+            "Merhaba! Hazırım. Sorunu yaz, birlikte çözelim.",
+            "Selam kral 😎 Ne üzerinde çalışıyoruz?"
         ]), "selamlama"
+
     if parts["is_math"]:
         try:
             return f"Sonuç: {safe_math(query)}", "matematik"
         except Exception:
             return "Bu matematik ifadesini güvenli şekilde çözemedim.", "hata"
+
+    creative = local_creative_answer(query)
+    if creative:
+        return creative
+
+    if parts.get("is_recommendation"):
+        recommendation = recommendation_answer(query)
+        if recommendation:
+            return recommendation
+
     if parts.get("is_code_request"):
-        return code_response(query)
+        # user_id varsa dosya sahipliği için geçeriz
+        uid = None
+        try:
+            u = get_current_user()
+            if u:
+                uid = u.get("id")
+        except Exception:
+            pass
+        return code_response(query, user_id=uid)
+
     normalized = normalize(query)
     if normalized in DATASET and DATASET[normalized]:
         return random.choice(DATASET[normalized]), "veri_seti"
+
     cached = memory_get(normalized)
     if cached and "Kaynak:" not in cached and not re.search(r"https?://", cached):
         return cached, "hafiza"
+
+    local_fact = local_knowledge_answer(query)
+    if local_fact:
+        memory_save(normalized, local_fact, 0.90, "yerel_bilgi")
+        return local_fact, "yerel_bilgi"
+
+    # Search is used only as a source of facts; no third-party AI is called.
     results = search_everywhere(query, parts)
-    if results:
-        answer = synthesize_answer(query, results, parts)
-        if answer:
-            memory_save(normalized, answer, 0.86, "web")
-            return answer, "web"
-    return "Aradım ama güvenilir ve yeterli bir sonuç bulamadım. İstersen soruyu biraz daha açık yaz.", "bulunamadi"
+    answer = synthesize_answer(query, results, parts)
+    if answer:
+        memory_save(normalized, answer, 0.72, "web_sentez")
+        return answer, "web_sentez"
+
+    return local_fallback_answer(query), "yerel_fallback"
 
 # =========================================================
-# AUTH
+# AUTH — Kalıcı oturum + güvenli kullanıcı yönetimi
 # =========================================================
 
 def get_current_user():
     token = request.cookies.get("session_token")
-
     if not token:
         return None
+    try:
+        with db_cursor() as cur:
+            row = cur.execute("""
+                SELECT u.id, u.username, u.api_key, u.created_at, u.last_login, u.is_active
+                FROM users u
+                JOIN sessions s ON u.id = s.user_id
+                WHERE s.token = ?
+                  AND (s.expires_at IS NULL OR s.expires_at > ?)
+                  AND u.is_active = 1
+            """, (token, datetime.now().isoformat())).fetchone()
+            return dict(row) if row else None
+    except Exception as e:
+        print(f"[get_current_user] {e}")
+        return None
 
-    conn = db()
 
-    row = conn.execute("""
-        SELECT u.*
-        FROM users u
-        JOIN sessions s ON u.id = s.user_id
-        WHERE s.token = ?
-    """, (token,)).fetchone()
+def create_session(user_id, days=30):
+    token = secrets.token_hex(32)
+    now = datetime.now()
+    expires = (now + timedelta(days=days)).isoformat()
+    try:
+        with db_cursor() as cur:
+            cur.execute("""
+                INSERT INTO sessions (token, user_id, created_at, expires_at)
+                VALUES (?, ?, ?, ?)
+            """, (token, user_id, now.isoformat(), expires))
+            cur.execute(
+                "UPDATE users SET last_login = ? WHERE id = ?",
+                (now.isoformat(), user_id)
+            )
+        return token
+    except Exception as e:
+        print(f"[create_session] {e}")
+        return None
 
-    conn.close()
 
-    return row
+def destroy_session(token):
+    if not token:
+        return
+    try:
+        with db_cursor() as cur:
+            cur.execute("DELETE FROM sessions WHERE token = ?", (token,))
+    except Exception:
+        pass
+
 
 def login_required(func):
     @wraps(func)
@@ -890,7 +1360,6 @@ def login_required(func):
         if not get_current_user():
             return redirect("/login")
         return func(*args, **kwargs)
-
     return decorated
 
 # =========================================================
@@ -957,11 +1426,10 @@ button,input{font:inherit}
   width:36px;
   height:36px;
   border-radius:12px;
-  display:grid;
-  place-items:center;
-  background:linear-gradient(135deg,#20e4aa,#08a97b);
-  box-shadow:0 8px 28px rgba(22,211,154,.2);
-  font-weight:900;
+  display:block;
+  object-fit:contain;
+  background:transparent;
+  box-shadow:none;
 }
 
 .nav-actions{
@@ -1577,140 +2045,207 @@ input:focus{
   cursor:pointer;
 }
 
-/* VANTORIUM GEMINI-INSPIRED CHAT REFRESH */
+/* ========== GEMINI-STYLE CHAT UI ========== */
 .chat-shell{
-  height:calc(100dvh - 68px);
+  height:100dvh;
   min-height:520px;
   display:grid;
-  grid-template-columns:250px minmax(0,1fr);
+  grid-template-columns:260px minmax(0,1fr);
   background:#0b0d10;
   overflow:hidden;
 }
+body:has(.chat-shell){margin:0;overflow:hidden}
 .chat-sidebar{
   border-right:1px solid rgba(255,255,255,.07);
   background:#101216;
-  padding:18px 13px;
-  display:flex;flex-direction:column;gap:18px;
+  padding:16px 12px;
+  display:flex;flex-direction:column;gap:14px;
+  overflow-y:auto;
 }
 .sidebar-new{
   display:flex;align-items:center;gap:10px;width:100%;
-  padding:13px 15px;border:1px solid rgba(255,255,255,.09);
-  border-radius:15px;background:#1a1d23;color:#f2f4f7;
-  font-weight:650;cursor:pointer;text-align:left;
+  padding:12px 14px;border:1px solid rgba(255,255,255,.09);
+  border-radius:14px;background:#1a1d23;color:#f2f4f7;
+  font-weight:650;cursor:pointer;text-align:left;font-size:14px;
+  transition:.15s;
 }
 .sidebar-new:hover,.sidebar-link:hover{background:#22262d}
-.sidebar-label{padding:0 10px;color:#7e8794;font-size:11px;font-weight:800;letter-spacing:1px;text-transform:uppercase}
+.sidebar-label{padding:4px 10px;color:#7e8794;font-size:11px;font-weight:800;letter-spacing:.8px;text-transform:uppercase}
 .sidebar-link{
-  display:flex;align-items:center;gap:11px;padding:11px 12px;
+  display:flex;align-items:center;gap:11px;padding:10px 12px;
   border-radius:12px;color:#c4cad3;font-size:13px;font-weight:600;
+  transition:.15s;
 }
-.sidebar-bottom{margin-top:auto;display:grid;gap:5px}
+.sidebar-bottom{margin-top:auto;display:grid;gap:4px;padding-top:12px;border-top:1px solid rgba(255,255,255,.06)}
 .chat-main{min-width:0;display:flex;flex-direction:column;position:relative;background:#0b0d10}
 .chat-topbar{
-  height:62px;flex-shrink:0;display:flex;align-items:center;
-  justify-content:space-between;padding:0 25px;border-bottom:1px solid rgba(255,255,255,.055);
+  height:56px;flex-shrink:0;display:flex;align-items:center;
+  justify-content:space-between;padding:0 22px;
+  border-bottom:1px solid rgba(255,255,255,.055);
 }
 .chat-model{display:flex;align-items:center;gap:9px;font-size:14px;font-weight:700;color:#e8ebef}
-.model-pill{font-size:11px;color:#8f99a7;background:#1a1e25;padding:5px 9px;border-radius:20px}
-.chat-top-actions{display:flex;align-items:center;gap:8px}
-.top-icon{width:36px;height:36px;border:0;border-radius:50%;background:transparent;color:#aeb7c4;cursor:pointer;font-size:17px}
-.top-icon:hover{background:#20242b;color:white}
-.chat-history{
-  flex:1;min-height:0;overflow:auto;padding:34px 24px 150px;
-  width:100%;max-width:900px;margin:0 auto;scrollbar-width:thin;
-  scrollbar-color:#343943 transparent;
+.model-pill{
+  font-size:11px;color:#9bbcf2;background:rgba(138,180,248,.12);
+  padding:4px 10px;border-radius:20px;font-weight:700;
 }
-.chat-row{display:flex;align-items:flex-start;gap:13px;margin:0 auto 26px;max-width:790px;width:100%}
+.chat-top-actions{display:flex;align-items:center;gap:6px}
+.top-icon{
+  width:36px;height:36px;border:0;border-radius:50%;
+  background:transparent;color:#aeb7c4;cursor:pointer;font-size:17px;
+  display:grid;place-items:center;transition:.15s;
+}
+.top-icon:hover{background:#20242b;color:#fff}
+.chat-history{
+  flex:1;min-height:0;overflow:auto;padding:28px 20px 160px;
+  width:100%;max-width:860px;margin:0 auto;
+  scrollbar-width:thin;scrollbar-color:#343943 transparent;
+}
+.chat-row{
+  display:flex;align-items:flex-start;gap:12px;
+  margin:0 auto 22px;max-width:760px;width:100%;
+  animation:msgIn .28s ease;
+}
+@keyframes msgIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
 .chat-row.user{justify-content:flex-end}
-.chat-row .avatar{width:32px;height:32px;flex:0 0 32px;border-radius:50%;display:grid;place-items:center;font-weight:800;font-size:12px}
+.chat-row .avatar{
+  width:32px;height:32px;flex:0 0 32px;border-radius:50%;
+  display:grid;place-items:center;font-weight:800;font-size:12px;
+  overflow:hidden;
+}
 .chat-row.ai .avatar{background:linear-gradient(145deg,#8ab4f8,#7c8df5);color:#101827}
 .chat-row.user .avatar{background:#2b3038;color:#f4f6f8;order:2}
-.bubble{max-width:min(100%,720px);font-size:15px;line-height:1.8;color:#e2e5e9;overflow-wrap:anywhere}
+.bubble{max-width:min(100%,700px);font-size:15px;line-height:1.75;color:#e2e5e9;overflow-wrap:anywhere}
 .chat-row.user .bubble{
-  background:#20242b;border:1px solid rgba(255,255,255,.045);
-  border-radius:22px;padding:12px 17px;max-width:min(78%,600px);line-height:1.65;
+  background:#20242b;border:1px solid rgba(255,255,255,.05);
+  border-radius:20px 20px 6px 20px;padding:11px 16px;
+  max-width:min(78%,560px);line-height:1.6;
 }
-.chat-row.ai .bubble{padding:1px 0}
-.chat-welcome{max-width:790px;margin:9vh auto 35px;padding:0 8px}
-.welcome-kicker{font-size:14px;color:#a9b5c7;margin-bottom:12px}
-.chat-welcome h1{font-size:clamp(30px,5vw,48px);line-height:1.12;letter-spacing:-1.7px;font-weight:650;color:#eef2f8}
-.chat-welcome h1 span{background:linear-gradient(90deg,#8ab4f8,#c4a7ff);-webkit-background-clip:text;background-clip:text;color:transparent}
-.welcome-sub{margin-top:13px;color:#929ba8;font-size:15px}
-.prompt-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:30px}
+.chat-row.ai .bubble{padding:2px 0}
+.chat-welcome{max-width:760px;margin:8vh auto 32px;padding:0 8px;text-align:left}
+.welcome-kicker{font-size:14px;color:#a9b5c7;margin-bottom:10px;font-weight:500}
+.chat-welcome h1{
+  font-size:clamp(28px,4.8vw,44px);line-height:1.15;
+  letter-spacing:-1.4px;font-weight:650;color:#eef2f8;margin:0;
+}
+.chat-welcome h1 span{
+  background:linear-gradient(90deg,#8ab4f8,#c4a7ff);
+  -webkit-background-clip:text;background-clip:text;color:transparent;
+}
+.welcome-sub{margin-top:12px;color:#929ba8;font-size:15px;line-height:1.5}
+.prompt-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:28px}
 .prompt-chip{
-  min-height:74px;text-align:left;padding:14px 16px;border-radius:16px;
-  border:1px solid rgba(255,255,255,.075);background:#14171d;color:#d8dde5;
-  cursor:pointer;font-size:13px;line-height:1.5;transition:.18s;
+  min-height:72px;text-align:left;padding:14px 15px;border-radius:16px;
+  border:1px solid rgba(255,255,255,.07);background:#14171d;color:#d8dde5;
+  cursor:pointer;font-size:13px;line-height:1.45;transition:.18s;
+  display:flex;flex-direction:column;justify-content:center;
 }
-.prompt-chip:hover{background:#1b2028;border-color:rgba(138,180,248,.35);transform:translateY(-1px)}
-.prompt-chip small{display:block;color:#7f8998;margin-top:5px}
+.prompt-chip:hover{
+  background:#1b2028;border-color:rgba(138,180,248,.4);
+  transform:translateY(-2px);box-shadow:0 8px 24px rgba(0,0,0,.25);
+}
+.prompt-chip small{display:block;color:#7f8998;margin-top:5px;font-size:12px}
 .composer-dock{
-  position:absolute;left:0;right:0;bottom:0;padding:18px 24px 22px;
-  background:linear-gradient(180deg,rgba(11,13,16,0),#0b0d10 22%);
+  position:absolute;left:0;right:0;bottom:0;padding:16px 20px 20px;
+  background:linear-gradient(180deg,rgba(11,13,16,0) 0%,#0b0d10 28%);
 }
-.composer-wrap{max-width:790px;margin:0 auto}
+.composer-wrap{max-width:760px;margin:0 auto}
 .composer{
-  display:flex;align-items:flex-end;gap:10px;padding:12px 13px 12px 18px;
-  border:1px solid #343a45;border-radius:25px;background:#1b1f26;
-  box-shadow:0 8px 35px rgba(0,0,0,.28);transition:.18s;
+  display:flex;align-items:flex-end;gap:8px;padding:10px 12px 10px 16px;
+  border:1px solid #343a45;border-radius:24px;background:#1b1f26;
+  box-shadow:0 8px 32px rgba(0,0,0,.3);transition:.18s;
 }
-.composer:focus-within{border-color:#7189b6;box-shadow:0 0 0 3px rgba(138,180,248,.09),0 8px 35px rgba(0,0,0,.28)}
+.composer:focus-within{
+  border-color:#7189b6;
+  box-shadow:0 0 0 3px rgba(138,180,248,.1),0 8px 32px rgba(0,0,0,.3);
+}
 .composer textarea{
-  flex:1;min-width:0;max-height:170px;min-height:30px;resize:none;
+  flex:1;min-width:0;max-height:160px;min-height:28px;resize:none;
   border:0;outline:0;background:transparent;color:#f1f3f7;
-  font:15px/1.55 Inter,system-ui,sans-serif;padding:5px 0;
+  font:15px/1.5 Inter,system-ui,sans-serif;padding:6px 0;
 }
 .composer textarea::placeholder{color:#8b929e}
-.composer-tools{display:flex;align-items:center;gap:7px}
-.composer-tool{
-  width:36px;height:36px;border:0;border-radius:50%;background:transparent;
-  color:#b5bdc8;cursor:pointer;font-size:20px;
-}
-.composer-tool:hover{background:#303640}
+.composer-tools{display:flex;align-items:center;gap:4px}
 .send-btn{
-  width:42px;height:42px;border:0;border-radius:50%;display:grid;place-items:center;
-  background:#a8c7fa;color:#142238;cursor:pointer;transition:.18s;
+  width:40px;height:40px;border:0;border-radius:50%;display:grid;place-items:center;
+  background:#a8c7fa;color:#142238;cursor:pointer;transition:.18s;flex-shrink:0;
 }
-.send-btn:hover{background:#c0d7ff;transform:scale(1.04)}
-.send-btn:disabled{opacity:.42;cursor:wait;transform:none}
-.composer-hint{text-align:center;color:#707987;font-size:11px;margin-top:10px}
+.send-btn:hover{background:#c0d7ff;transform:scale(1.05)}
+.send-btn:disabled{opacity:.4;cursor:wait;transform:none}
+.composer-hint{text-align:center;color:#707987;font-size:11px;margin-top:9px}
 .thinking{display:flex;align-items:center;gap:9px;color:#dce5f5;font-weight:650}
-.thinking-dot{width:8px;height:8px;border-radius:50%;background:#9bbcf2;box-shadow:0 0 0 5px rgba(155,188,242,.1);animation:vPulse 1s infinite}
-.status-line{font-size:12px;color:#818b99;margin-top:5px}
+.thinking-dot{
+  width:8px;height:8px;border-radius:50%;background:#9bbcf2;
+  box-shadow:0 0 0 5px rgba(155,188,242,.12);animation:vPulse 1s infinite;
+}
+.status-line{font-size:12px;color:#818b99;margin-top:4px}
 @keyframes vPulse{50%{opacity:.35;transform:scale(.8)}}
-.code-card{margin:15px 0;border:1px solid #343b47;border-radius:15px;overflow:hidden;background:#101319}
-.code-card-head{display:flex;align-items:center;justify-content:space-between;padding:10px 13px;background:#191e26;border-bottom:1px solid #303641}
-.code-lang{color:#aab8ce;font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.8px}
-.copy-code{border:0;border-radius:9px;padding:8px 12px;background:#d7e3f8;color:#182437;font-size:12px;font-weight:800;cursor:pointer}
-.code-card pre{margin:0;padding:16px;max-height:520px;overflow:auto;white-space:pre;color:#e7ebf2;font:12px/1.7 ui-monospace,SFMono-Regular,Consolas,monospace}
-.chat-error{color:#ff9c9c;background:rgba(255,80,80,.08);border:1px solid rgba(255,80,80,.16);padding:12px 14px;border-radius:12px}
-@media(max-width:850px){
- .chat-shell{grid-template-columns:1fr;height:calc(100dvh - 62px)}
- .chat-sidebar{display:none}
- .chat-topbar{height:54px;padding:0 16px}
- .chat-history{padding:24px 17px 145px}
- .composer-dock{padding:12px 12px calc(14px + env(safe-area-inset-bottom))}
- .chat-welcome{margin:8vh auto 28px}
+.code-card{
+  margin:14px 0;border:1px solid #343b47;border-radius:14px;
+  overflow:hidden;background:#101319;
+}
+.code-card-head{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:9px 12px;background:#191e26;border-bottom:1px solid #303641;
+}
+.code-lang{color:#aab8ce;font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.7px}
+.copy-code{
+  border:0;border-radius:8px;padding:7px 11px;background:#d7e3f8;
+  color:#182437;font-size:12px;font-weight:800;cursor:pointer;transition:.15s;
+}
+.copy-code:hover{filter:brightness(1.08)}
+.code-card pre{
+  margin:0;padding:14px;max-height:480px;overflow:auto;white-space:pre;
+  color:#e7ebf2;font:12px/1.65 ui-monospace,SFMono-Regular,Consolas,monospace;
+}
+/* Dosya indirme kartı (uzun kodlar) */
+.file-card{
+  margin:14px 0;padding:16px 18px;border-radius:16px;
+  border:1px solid rgba(138,180,248,.25);
+  background:linear-gradient(135deg,rgba(138,180,248,.08),rgba(124,141,245,.04));
+  display:flex;align-items:center;gap:14px;flex-wrap:wrap;
+}
+.file-card .file-icon{
+  width:42px;height:42px;border-radius:12px;
+  background:rgba(138,180,248,.18);display:grid;place-items:center;
+  font-size:20px;flex-shrink:0;
+}
+.file-card .file-info{flex:1;min-width:140px}
+.file-card .file-name{font-weight:700;font-size:14px;color:#e8eef8}
+.file-card .file-meta{font-size:12px;color:#8b96a7;margin-top:3px}
+.file-card a.file-dl{
+  display:inline-flex;align-items:center;gap:6px;
+  padding:10px 16px;border-radius:12px;background:#a8c7fa;color:#142238;
+  font-weight:800;font-size:13px;text-decoration:none;transition:.15s;
+}
+.file-card a.file-dl:hover{background:#c0d7ff;transform:translateY(-1px)}
+.chat-error{
+  color:#ff9c9c;background:rgba(255,80,80,.08);
+  border:1px solid rgba(255,80,80,.16);padding:12px 14px;border-radius:12px;
+}
+@media(max-width:900px){
+  .chat-shell{grid-template-columns:1fr;height:100dvh}
+  .chat-sidebar{display:none}
+  .chat-topbar{height:52px;padding:0 14px}
+  .chat-history{padding:20px 14px 150px}
+  .composer-dock{padding:12px 12px calc(14px + env(safe-area-inset-bottom))}
+  .chat-welcome{margin:7vh auto 24px}
 }
 @media(max-width:520px){
- .navbar{height:62px;padding:0 12px}
- .navbar .nav-actions{gap:0}
- .navbar .btn-nav{font-size:11px;padding:8px 6px}
- .navbar .logo{font-size:15px}
- .navbar .logo-icon{width:32px;height:32px}
- .chat-history{padding:20px 13px 142px}
- .chat-row{gap:9px;margin-bottom:22px}
- .chat-row .avatar{width:29px;height:29px;flex-basis:29px}
- .bubble{font-size:14px;line-height:1.75}
- .chat-row.user .bubble{max-width:84%}
- .chat-welcome{margin:9vh auto 25px;padding:0 4px}
- .chat-welcome h1{font-size:34px}
- .prompt-grid{grid-template-columns:1fr 1fr;gap:8px;margin-top:24px}
- .prompt-chip{padding:12px;min-height:80px;font-size:12px}
- .composer{border-radius:21px;padding:9px 9px 9px 14px}
- .composer textarea{font-size:14px}
- .send-btn{width:40px;height:40px}
- .composer-hint{font-size:10px}
+  .navbar{height:60px;padding:0 10px}
+  .navbar .btn-nav{font-size:11px;padding:7px 5px}
+  .navbar .logo{font-size:14px}
+  .chat-history{padding:16px 12px 140px}
+  .chat-row{gap:8px;margin-bottom:18px}
+  .chat-row .avatar{width:28px;height:28px;flex-basis:28px}
+  .bubble{font-size:14px}
+  .chat-row.user .bubble{max-width:86%}
+  .chat-welcome h1{font-size:30px}
+  .prompt-grid{grid-template-columns:1fr 1fr;gap:8px;margin-top:20px}
+  .prompt-chip{padding:12px;min-height:70px;font-size:12px}
+  .composer{border-radius:20px;padding:8px 8px 8px 12px}
+  .composer textarea{font-size:14px}
+  .send-btn{width:38px;height:38px}
+  .file-card{padding:12px 14px}
 }
 
 </style>
@@ -1788,7 +2323,7 @@ def render_page(title, content, user=None, show_nav=True, modal=False):
         nav = f"""
         <header class="navbar">
           <a href="/" class="logo">
-            <span class="logo-icon">V</span>
+            <img class="logo-icon" src="/icon.png" alt="Vantorium">
             Vantorium
           </a>
           <nav class="nav-actions">{actions}</nav>
@@ -1818,6 +2353,223 @@ def render_page(title, content, user=None, show_nav=True, modal=False):
     </html>
     """
 
+
+# =========================================================
+# SITE PROTECTION: HUMAN GATE + RATE LIMITING (Gelişmiş)
+# =========================================================
+
+_RATE_BUCKETS = defaultdict(deque)
+_RATE_LOCK = Lock()
+_FAIL_BUCKETS = defaultdict(deque)   # başarısız login / captcha denemeleri
+_BLOCKED_IPS = {}                    # ip -> unblock_timestamp
+
+def client_ip():
+    # TRUST_PROXY=1 ise X-Forwarded-For kullanılır (Railway vb.)
+    if os.environ.get("TRUST_PROXY", "").lower() == "1":
+        forwarded = request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+        if forwarded:
+            return forwarded[:64]
+    return (request.remote_addr or "unknown")[:64]
+
+
+def is_ip_blocked(ip):
+    until = _BLOCKED_IPS.get(ip)
+    if until and until > time.time():
+        return True
+    if until:
+        _BLOCKED_IPS.pop(ip, None)
+    return False
+
+
+def record_failure(ip, kind="login", limit=8, window=600, ban_seconds=1800):
+    """Başarısız denemeleri sayar, eşiği aşınca IP'yi geçici banlar."""
+    key = f"{kind}:{ip}"
+    now = time.time()
+    with _RATE_LOCK:
+        bucket = _FAIL_BUCKETS[key]
+        while bucket and now - bucket[0] > window:
+            bucket.popleft()
+        bucket.append(now)
+        if len(bucket) >= limit:
+            _BLOCKED_IPS[ip] = now + ban_seconds
+            bucket.clear()
+            return True
+    return False
+
+
+def rate_limit(limit=12, window=60):
+    def decorator(func):
+        @wraps(func)
+        def wrapped(*args, **kwargs):
+            ip = client_ip()
+            if is_ip_blocked(ip):
+                retry = max(1, int(_BLOCKED_IPS.get(ip, time.time()) - time.time()))
+                resp = jsonify({
+                    "error": "Çok fazla başarısız deneme. IP geçici olarak engellendi.",
+                    "retry_after": retry
+                })
+                resp.status_code = 429
+                resp.headers["Retry-After"] = str(retry)
+                return resp
+
+            key = f"{func.__name__}:{ip}"
+            now = time.time()
+            with _RATE_LOCK:
+                bucket = _RATE_BUCKETS[key]
+                while bucket and now - bucket[0] > window:
+                    bucket.popleft()
+                if len(bucket) >= limit:
+                    retry = max(1, int(window - (now - bucket[0])))
+                    # Aşırı istekte de kısa ban
+                    if len(bucket) > limit * 3:
+                        _BLOCKED_IPS[ip] = now + 300
+                    resp = jsonify({
+                        "error": "Çok fazla istek gönderildi. Biraz bekleyip tekrar dene.",
+                        "retry_after": retry
+                    })
+                    resp.status_code = 429
+                    resp.headers["Retry-After"] = str(retry)
+                    return resp
+                bucket.append(now)
+            return func(*args, **kwargs)
+        return wrapped
+    return decorator
+
+
+def captcha_page():
+    nonce = secrets.token_urlsafe(24)
+    session["human_nonce"] = nonce
+    session["human_started"] = time.time()
+    icon_url = "/icon.png"
+    page = f"""<!doctype html>
+<html lang="tr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#101114"><title>Güvenlik doğrulaması | Vantorium</title>
+<style>
+*{{box-sizing:border-box}}body{{margin:0;min-height:100vh;display:grid;place-items:center;padding:22px;
+background:#101114;color:#e8eaed;font-family:Inter,system-ui,-apple-system,Segoe UI,sans-serif}}
+.card{{width:min(420px,100%);padding:32px 26px;border:1px solid #30343b;border-radius:22px;
+background:#17191e;box-shadow:0 22px 80px #0007;text-align:center}}
+.brand{{width:58px;height:58px;object-fit:contain;margin:0 auto 22px;display:block}}
+h1{{font-size:20px;font-weight:600;margin:0 0 9px}}p{{font-size:14px;line-height:1.6;color:#aab1bd;margin:0 0 24px}}
+.checkrow{{display:flex;align-items:center;gap:13px;padding:16px;border:1px solid #3a404a;
+border-radius:12px;background:#20242b;text-align:left;cursor:pointer;user-select:none}}
+.checkrow input{{width:22px;height:22px;accent-color:#8ab4f8;cursor:pointer}}
+.checkrow span{{font-size:14px;color:#e8eaed}}
+.spinner{{display:none;width:27px;height:27px;border:3px solid #424955;border-top-color:#a8c7fa;
+border-radius:50%;animation:spin .8s linear infinite;margin-left:auto}}
+@keyframes spin{{to{{transform:rotate(360deg)}}}}
+#status{{min-height:22px;margin-top:17px;color:#aab1bd;font-size:12px}}
+.small{{margin-top:22px;color:#707987;font-size:11px}}
+</style></head><body><main class="card">
+<img class="brand" src="{icon_url}" alt="Vantorium">
+<h1>Güvenlik kontrolü</h1>
+<p>Bot Olmadığınızı doğrulamak için basın.</p>
+<div class="checkrow" id="checkLabel">
+<input id="humanCheck" type="checkbox">
+<span>Ben robot değilim</span><span class="spinner" id="spinner"></span>
+</div>
+<div id="status" role="status" aria-live="polite"></div>
+<div class="small">Vantorium güvenlik doğrulaması</div>
+</main>
+<script>
+(() => {{
+ const box=document.getElementById("humanCheck"), label=document.getElementById("checkLabel");
+ const spinner=document.getElementById("spinner"), status=document.getElementById("status");
+ let pointerCount=0, started=performance.now(), moved=false, busy=false;
+ document.addEventListener("pointermove",()=>{{pointerCount++;moved=true;}},{{passive:true}});
+ document.addEventListener("pointerdown",()=>{{pointerCount++;moved=true;}},{{passive:true,once:true}});
+ box.addEventListener("click", async (event)=>{{
+   if(event.target!==box) return;
+   if(busy) return;
+   if(!box.checked) return;
+   busy=true; box.disabled=true; spinner.style.display="block";
+   status.textContent="Kontrol ediliyor...";
+   const elapsed=Math.round(performance.now()-started);
+   try {{
+     const r=await fetch("/_human-check",{{method:"POST",headers:{{"Content-Type":"application/json"}},
+       body:JSON.stringify({{nonce:{json.dumps(nonce)},elapsed:elapsed,pointerCount:pointerCount,moved:moved}}),
+       credentials:"same-origin"}});
+     const data=await r.json();
+     if(!r.ok || !data.ok) throw new Error(data.error||"Doğrulama başarısız.");
+     status.textContent="Doğrulandı. Yönlendiriliyorsun...";
+     location.replace(data.next||"/");
+   }} catch(e) {{
+     status.textContent=e.message||"Tekrar deneyin.";
+     box.checked=false;box.disabled=false;spinner.style.display="none";busy=false;
+   }}
+ }});
+}})();
+</script></body></html>"""
+    return make_response(page, 200)
+
+
+@app.before_request
+def site_human_gate():
+    # API calls are intentionally never shown a browser CAPTCHA.
+    path = request.path or "/"
+    if path.startswith("/api") or path.startswith("/api-key=") or path in ("/_human-check", "/icon.png", "/favicon.ico"):
+        return None
+    if request.method != "GET":
+        return None
+    if session.get("human_verified_at") and time.time() - float(session["human_verified_at"]) < 12 * 3600:
+        return None
+    return captcha_page()
+
+
+@app.route("/_human-check", methods=["POST"])
+@rate_limit(10, 120)
+def human_check():
+    ip = client_ip()
+    if is_ip_blocked(ip):
+        return jsonify({"ok": False, "error": "Çok fazla deneme. Daha sonra tekrar dene."}), 429
+
+    data = request.get_json(silent=True) or {}
+    expected = session.get("human_nonce")
+    nonce = str(data.get("nonce", ""))
+    elapsed = int(data.get("elapsed", 0) or 0)
+    pointer_count = int(data.get("pointerCount", 0) or 0)
+    moved = bool(data.get("moved"))
+    started = float(session.get("human_started", 0) or 0)
+    server_elapsed = time.time() - started
+
+    ok = (
+        expected
+        and secrets.compare_digest(expected, nonce)
+        and elapsed >= 700
+        and 0.7 <= server_elapsed <= 180
+        and pointer_count >= 1
+        and moved
+    )
+    if not ok:
+        record_failure(ip, kind="captcha", limit=12, window=600, ban_seconds=900)
+        return jsonify({"ok": False, "error": "Doğrulama tamamlanamadı. Kutucuğa tekrar basıp deneyin."}), 400
+
+    session.pop("human_nonce", None)
+    session.pop("human_started", None)
+    session["human_verified_at"] = time.time()
+    return jsonify({"ok": True, "next": "/"})
+
+
+@app.route("/icon.png")
+def site_icon():
+    folder = os.path.dirname(os.path.abspath(__file__))
+    icon_path = os.path.join(folder, "icon.png")
+    if not os.path.isfile(icon_path):
+        return Response(status=404)
+    return send_from_directory(folder, "icon.png", mimetype="image/png", max_age=86400)
+
+
+@app.after_request
+def add_security_headers(response):
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    response.headers.setdefault("Cache-Control", "no-store" if request.path.startswith("/api") else "private, max-age=0")
+    return response
+
+
 # =========================================================
 # ROUTES
 # =========================================================
@@ -1829,6 +2581,7 @@ def index():
     return redirect("/login")
 
 @app.route("/register", methods=["GET", "POST"])
+@rate_limit(5, 300)
 def register():
     if get_current_user():
         return redirect("/chat")
@@ -1839,39 +2592,37 @@ def register():
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
 
-        if len(username) < 3 or len(username) > 32:
-            error = "Kullanıcı adı 3-32 karakter arasında olmalı."
+        if not re.fullmatch(r"[a-zA-Z0-9_.-]{3,32}", username):
+            error = "Kullanıcı adı 3-32 karakter olmalı (harf, rakam, _ . -)."
         elif len(password) < 6:
             error = "Şifre en az 6 karakter olmalı."
         else:
-            conn = db()
-
-            exists = conn.execute(
-                "SELECT id FROM users WHERE username = ?",
-                (username,)
-            ).fetchone()
-
-            if exists:
+            try:
+                with db_cursor() as cur:
+                    exists = cur.execute(
+                        "SELECT id FROM users WHERE username = ?",
+                        (username,)
+                    ).fetchone()
+                    if exists:
+                        error = "Bu kullanıcı adı zaten alınmış."
+                    else:
+                        api_key = "vnt_" + secrets.token_hex(24)
+                        cur.execute("""
+                            INSERT INTO users
+                            (username, password_hash, api_key, created_at, is_active)
+                            VALUES (?, ?, ?, ?, 1)
+                        """, (
+                            username,
+                            hash_password(password),
+                            api_key,
+                            datetime.now().isoformat()
+                        ))
+                        return redirect("/login?registered=1")
+            except sqlite3.IntegrityError:
                 error = "Bu kullanıcı adı zaten alınmış."
-                conn.close()
-            else:
-                api_key = "vnt_" + secrets.token_hex(24)
-
-                conn.execute("""
-                    INSERT INTO users
-                    (username,password_hash,api_key,created_at)
-                    VALUES (?,?,?,?)
-                """, (
-                    username,
-                    hash_password(password),
-                    api_key,
-                    datetime.now().isoformat()
-                ))
-
-                conn.commit()
-                conn.close()
-
-                return redirect("/login?registered=1")
+            except Exception as e:
+                print(f"[register] {e}")
+                error = "Kayıt sırasında bir hata oluştu. Tekrar dene."
 
     content = f"""
     <main class="auth-wrapper">
@@ -1892,6 +2643,7 @@ def register():
             maxlength="32"
             autocomplete="username"
             placeholder="kullanici_adi"
+            pattern="[a-zA-Z0-9_.-]{{3,32}}"
             required
           >
 
@@ -1919,6 +2671,7 @@ def register():
     return render_page("Kayıt", content, modal=True)
 
 @app.route("/login", methods=["GET", "POST"])
+@rate_limit(8, 300)
 def login():
     if get_current_user():
         return redirect("/chat")
@@ -1929,40 +2682,33 @@ def login():
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
 
-        conn = db()
+        try:
+            with db_cursor() as cur:
+                user = cur.execute(
+                    "SELECT * FROM users WHERE username = ? AND is_active = 1",
+                    (username,)
+                ).fetchone()
 
-        user = conn.execute(
-            "SELECT * FROM users WHERE username = ?",
-            (username,)
-        ).fetchone()
-
-        if user and user["password_hash"] == hash_password(password):
-            token = secrets.token_hex(32)
-
-            conn.execute("""
-                INSERT INTO sessions(token,user_id,created_at)
-                VALUES (?,?,?)
-            """, (
-                token,
-                user["id"],
-                datetime.now().isoformat()
-            ))
-
-            conn.commit()
-            conn.close()
-
-            response = make_response(redirect("/chat"))
-            response.set_cookie(
-                "session_token",
-                token,
-                httponly=True,
-                samesite="Lax",
-                max_age=30 * 24 * 3600
-            )
-            return response
-
-        conn.close()
-        error = "Kullanıcı adı veya şifre hatalı."
+            if user and user["password_hash"] == hash_password(password):
+                token = create_session(user["id"])
+                if token:
+                    response = make_response(redirect("/chat"))
+                    response.set_cookie(
+                        "session_token",
+                        token,
+                        httponly=True,
+                        samesite="Lax",
+                        max_age=30 * 24 * 3600,
+                        secure=request.is_secure
+                    )
+                    return response
+                error = "Oturum oluşturulamadı. Tekrar dene."
+            else:
+                record_failure(client_ip(), kind="login", limit=8, window=600, ban_seconds=1800)
+                error = "Kullanıcı adı veya şifre hatalı."
+        except Exception as e:
+            print(f"[login] {e}")
+            error = "Giriş sırasında bir hata oluştu."
 
     content = f"""
     <main class="auth-wrapper">
@@ -2009,16 +2755,7 @@ def login():
 @app.route("/logout")
 def logout():
     token = request.cookies.get("session_token")
-
-    if token:
-        conn = db()
-        conn.execute(
-            "DELETE FROM sessions WHERE token = ?",
-            (token,)
-        )
-        conn.commit()
-        conn.close()
-
+    destroy_session(token)
     response = make_response(redirect("/login"))
     response.delete_cookie("session_token")
     return response
@@ -2143,7 +2880,13 @@ def chat():
         row.className = "chat-row " + type;
         const avatar = document.createElement("div");
         avatar.className = "avatar";
-        avatar.textContent = type === "user" ? "K" : "V";
+        if (type === "user") avatar.textContent = "K";
+        else {
+          const mark = document.createElement("img");
+          mark.src = "/icon.png"; mark.alt = "Vantorium";
+          mark.style.cssText = "width:100%;height:100%;object-fit:contain;border-radius:inherit";
+          avatar.appendChild(mark);
+        }
         const bubble = document.createElement("div");
         bubble.className = "bubble";
         bubble.textContent = text;
@@ -2158,7 +2901,7 @@ def chat():
         const row = document.createElement("div");
         row.className = "chat-row ai";
         row.id = "thinkingRow";
-        row.innerHTML = `<div class="avatar">V</div><div class="bubble">
+        row.innerHTML = `<div class="avatar"><img src="/icon.png" alt="Vantorium" style="width:100%;height:100%;object-fit:contain;border-radius:inherit"></div><div class="bubble">
           <div class="thinking"><span class="thinking-dot"></span><span id="thinkingText">Düşünüyor...</span></div>
           <div class="status-line" id="thinkingSub">Sorunu analiz ediyor</div>
         </div>`;
@@ -2182,6 +2925,25 @@ def chat():
           codeBlocks.push({key, lang:lang || "code", code:code.replace(/^\n|\n$/g, "")});
           return key;
         });
+        // Markdown indirme linklerini yakala: [dosya.ext](/download/code/ID)
+        const fileCards = [];
+        safeText = safeText.replace(
+          /📥\s*\*\*İndir:\*\*\s*\[([^\]]+)\]\(\/download\/code\/([a-zA-Z0-9_-]+)\)/g,
+          (match, fname, fid) => {
+            const key = "VANTORIUM_FILE_" + fileCards.length;
+            fileCards.push({key, fname, fid});
+            return key;
+          }
+        );
+        // Daha genel markdown link de yakala
+        safeText = safeText.replace(
+          /\[([^\]]+\.(?:py|html|js|css|php|sql|sh|java|ts|go|rs|rb|swift|txt|json))\]\(\/download\/code\/([a-zA-Z0-9_-]+)\)/gi,
+          (match, fname, fid) => {
+            const key = "VANTORIUM_FILE_" + fileCards.length;
+            fileCards.push({key, fname, fid});
+            return key;
+          }
+        );
         let output = escapeHTML(safeText)
           .replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>")
           .replace(/`([^`]+)`/g, "<code>$1</code>")
@@ -2192,6 +2954,19 @@ def chat():
             <button class="copy-code" type="button">Kopyala</button></div>
             <pre><code>${escapeHTML(block.code)}</code></pre></div>`;
           output = output.replace(block.key, codeHTML);
+        }
+        for (const f of fileCards) {
+          const card = `<div class="file-card">
+            <div class="file-icon">📄</div>
+            <div class="file-info">
+              <div class="file-name">${escapeHTML(f.fname)}</div>
+              <div class="file-meta">Hazır dosya · 48 saat geçerli</div>
+            </div>
+            <a class="file-dl" href="/download/code/${escapeHTML(f.fid)}" download>
+              İndir ↓
+            </a>
+          </div>`;
+          output = output.replace(f.key, card);
         }
         return output;
       }
@@ -2295,10 +3070,11 @@ def chat():
     })();
     </script>
     """
-    return render_page("Sohbet", content, user)
+    return render_page("Sohbet", content, user, show_nav=False)
 
 
 @app.route("/api/chat", methods=["POST"])
+@rate_limit(12, 60)
 @login_required
 def api_chat():
     data = request.get_json(silent=True) or {}
@@ -2456,6 +3232,7 @@ def search_page():
     return render_page("Arama", content, user)
 
 @app.route("/api/search")
+@rate_limit(20, 60)
 @login_required
 def api_search():
     q = request.args.get("q", "").strip()
@@ -2532,15 +3309,14 @@ def dashboard():
 def regenerate_key():
     user = get_current_user()
     new_key = "vnt_" + secrets.token_hex(24)
-
-    conn = db()
-    conn.execute(
-        "UPDATE users SET api_key = ? WHERE id = ?",
-        (new_key, user["id"])
-    )
-    conn.commit()
-    conn.close()
-
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                "UPDATE users SET api_key = ? WHERE id = ?",
+                (new_key, user["id"])
+            )
+    except Exception as e:
+        print(f"[regenerate_key] {e}")
     return redirect("/dashboard")
 
 # =========================================================
@@ -2613,6 +3389,7 @@ def info():
 # =========================================================
 
 @app.route("/api-key=<apikey>", methods=["GET"])
+@rate_limit(30, 60)
 def api_word(apikey):
     word = request.args.get("word", "").strip()
 
@@ -2622,14 +3399,14 @@ def api_word(apikey):
             "usage": "/api-key=...?word=kelime"
         }), 400
 
-    conn = db()
-
-    user = conn.execute(
-        "SELECT * FROM users WHERE api_key = ?",
-        (apikey,)
-    ).fetchone()
-
-    conn.close()
+    try:
+        with db_cursor() as cur:
+            user = cur.execute(
+                "SELECT * FROM users WHERE api_key = ? AND is_active = 1",
+                (apikey,)
+            ).fetchone()
+    except Exception:
+        user = None
 
     if not user:
         return jsonify({
@@ -2637,7 +3414,6 @@ def api_word(apikey):
         }), 401
 
     start = time.time()
-
     answer, source = get_answer(word)
 
     return jsonify({
@@ -2645,14 +3421,65 @@ def api_word(apikey):
         "answer": answer,
         "meta": {
             "source": source,
-            "time_ms": round(
-                (time.time() - start) * 1000,
-                2
-            ),
-            "engine": "Vantorium v6.0",
+            "time_ms": round((time.time() - start) * 1000, 2),
+            "engine": "Vantorium Local Engine 9.0",
             "timestamp": datetime.now().astimezone().isoformat()
         }
     })
+
+# =========================================================
+# CODE FILE DOWNLOAD
+# =========================================================
+
+@app.route("/download/code/<file_id>")
+@login_required
+def download_code(file_id):
+    data = get_code_file(file_id)
+    if not data:
+        return "Dosya bulunamadı veya süresi dolmuş.", 404
+
+    filename = data["filename"]
+    content = data["content"]
+    language = data.get("language") or "txt"
+
+    mime_map = {
+        "python": "text/x-python",
+        "html": "text/html",
+        "css": "text/css",
+        "javascript": "application/javascript",
+        "php": "application/x-httpd-php",
+        "sql": "application/sql",
+        "bash": "application/x-sh",
+        "java": "text/x-java-source",
+    }
+    mimetype = mime_map.get(language, "text/plain")
+
+    tmp = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8",
+        suffix=os.path.splitext(filename)[1] or ".txt",
+        delete=False
+    )
+    try:
+        tmp.write(content)
+        tmp.close()
+        return send_file(
+            tmp.name,
+            mimetype=mimetype,
+            as_attachment=True,
+            download_name=filename
+        )
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except Exception:
+            pass
+
+
+@app.before_request
+def maybe_cleanup():
+    if random.random() < 0.015:
+        cleanup_expired()
+
 
 # =========================================================
 # START
@@ -2660,6 +3487,8 @@ def api_word(apikey):
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
+    print(f"[Vantorium] DB path : {DB_FILE}")
+    print(f"[Vantorium] Code dir: {CODE_FILES_DIR}")
     app.run(
         host="0.0.0.0",
         port=port,
