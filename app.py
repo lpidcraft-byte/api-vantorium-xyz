@@ -263,7 +263,7 @@ def cse_search(query, search_type="web", num=6):
             url,
             params=params,
             headers=headers,
-            timeout=12
+            timeout=7
         )
 
         if r.status_code != 200:
@@ -335,7 +335,7 @@ def cse_image_search(query, num=8):
     }
 
     try:
-        r = requests.get(url, params=params, headers=headers, timeout=12)
+        r = requests.get(url, params=params, headers=headers, timeout=7)
 
         if r.status_code != 200:
             return []
@@ -405,7 +405,7 @@ def wikipedia_search(query, num=4):
             url,
             params=params,
             headers={"User-Agent": "VantoriumAI/5.0"},
-            timeout=10
+            timeout=7
         )
 
         data = r.json()
@@ -463,7 +463,7 @@ def github_search(query, num=5):
             url,
             params=params,
             headers=headers,
-            timeout=10
+            timeout=7
         )
 
         if r.status_code != 200:
@@ -606,7 +606,7 @@ def github_repo_code_search(query, language="python", num_repos=4):
             "https://api.github.com/search/repositories",
             params={"q": repo_query, "sort": "stars", "order": "desc", "per_page": num_repos},
             headers={"Accept": "application/vnd.github+json", "User-Agent": "VantoriumAI/6.0"},
-            timeout=12
+            timeout=7
         )
         if r.status_code != 200:
             return []
@@ -622,7 +622,7 @@ def github_repo_code_search(query, language="python", num_repos=4):
                     f"https://api.github.com/repos/{owner}/{name}/git/trees/{urllib.parse.quote(branch, safe='')}",
                     params={"recursive": "1"},
                     headers={"Accept": "application/vnd.github+json", "User-Agent": "VantoriumAI/6.0"},
-                    timeout=12
+                    timeout=7
                 )
                 if tree_r.status_code != 200:
                     continue
@@ -641,7 +641,7 @@ def github_repo_code_search(query, language="python", num_repos=4):
                 path = file_item.get("path", "")
                 raw_url = f"https://raw.githubusercontent.com/{owner}/{name}/{urllib.parse.quote(branch, safe='')}/{path}"
                 try:
-                    code_r = requests.get(raw_url, headers={"User-Agent": "VantoriumAI/6.0"}, timeout=12)
+                    code_r = requests.get(raw_url, headers={"User-Agent": "VantoriumAI/6.0"}, timeout=7)
                     if code_r.status_code != 200:
                         continue
                     code = code_r.text
@@ -1576,6 +1576,143 @@ input:focus{
   font-size:12px;
   cursor:pointer;
 }
+
+/* VANTORIUM GEMINI-INSPIRED CHAT REFRESH */
+.chat-shell{
+  height:calc(100dvh - 68px);
+  min-height:520px;
+  display:grid;
+  grid-template-columns:250px minmax(0,1fr);
+  background:#0b0d10;
+  overflow:hidden;
+}
+.chat-sidebar{
+  border-right:1px solid rgba(255,255,255,.07);
+  background:#101216;
+  padding:18px 13px;
+  display:flex;flex-direction:column;gap:18px;
+}
+.sidebar-new{
+  display:flex;align-items:center;gap:10px;width:100%;
+  padding:13px 15px;border:1px solid rgba(255,255,255,.09);
+  border-radius:15px;background:#1a1d23;color:#f2f4f7;
+  font-weight:650;cursor:pointer;text-align:left;
+}
+.sidebar-new:hover,.sidebar-link:hover{background:#22262d}
+.sidebar-label{padding:0 10px;color:#7e8794;font-size:11px;font-weight:800;letter-spacing:1px;text-transform:uppercase}
+.sidebar-link{
+  display:flex;align-items:center;gap:11px;padding:11px 12px;
+  border-radius:12px;color:#c4cad3;font-size:13px;font-weight:600;
+}
+.sidebar-bottom{margin-top:auto;display:grid;gap:5px}
+.chat-main{min-width:0;display:flex;flex-direction:column;position:relative;background:#0b0d10}
+.chat-topbar{
+  height:62px;flex-shrink:0;display:flex;align-items:center;
+  justify-content:space-between;padding:0 25px;border-bottom:1px solid rgba(255,255,255,.055);
+}
+.chat-model{display:flex;align-items:center;gap:9px;font-size:14px;font-weight:700;color:#e8ebef}
+.model-pill{font-size:11px;color:#8f99a7;background:#1a1e25;padding:5px 9px;border-radius:20px}
+.chat-top-actions{display:flex;align-items:center;gap:8px}
+.top-icon{width:36px;height:36px;border:0;border-radius:50%;background:transparent;color:#aeb7c4;cursor:pointer;font-size:17px}
+.top-icon:hover{background:#20242b;color:white}
+.chat-history{
+  flex:1;min-height:0;overflow:auto;padding:34px 24px 150px;
+  width:100%;max-width:900px;margin:0 auto;scrollbar-width:thin;
+  scrollbar-color:#343943 transparent;
+}
+.chat-row{display:flex;align-items:flex-start;gap:13px;margin:0 auto 26px;max-width:790px;width:100%}
+.chat-row.user{justify-content:flex-end}
+.chat-row .avatar{width:32px;height:32px;flex:0 0 32px;border-radius:50%;display:grid;place-items:center;font-weight:800;font-size:12px}
+.chat-row.ai .avatar{background:linear-gradient(145deg,#8ab4f8,#7c8df5);color:#101827}
+.chat-row.user .avatar{background:#2b3038;color:#f4f6f8;order:2}
+.bubble{max-width:min(100%,720px);font-size:15px;line-height:1.8;color:#e2e5e9;overflow-wrap:anywhere}
+.chat-row.user .bubble{
+  background:#20242b;border:1px solid rgba(255,255,255,.045);
+  border-radius:22px;padding:12px 17px;max-width:min(78%,600px);line-height:1.65;
+}
+.chat-row.ai .bubble{padding:1px 0}
+.chat-welcome{max-width:790px;margin:9vh auto 35px;padding:0 8px}
+.welcome-kicker{font-size:14px;color:#a9b5c7;margin-bottom:12px}
+.chat-welcome h1{font-size:clamp(30px,5vw,48px);line-height:1.12;letter-spacing:-1.7px;font-weight:650;color:#eef2f8}
+.chat-welcome h1 span{background:linear-gradient(90deg,#8ab4f8,#c4a7ff);-webkit-background-clip:text;background-clip:text;color:transparent}
+.welcome-sub{margin-top:13px;color:#929ba8;font-size:15px}
+.prompt-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:30px}
+.prompt-chip{
+  min-height:74px;text-align:left;padding:14px 16px;border-radius:16px;
+  border:1px solid rgba(255,255,255,.075);background:#14171d;color:#d8dde5;
+  cursor:pointer;font-size:13px;line-height:1.5;transition:.18s;
+}
+.prompt-chip:hover{background:#1b2028;border-color:rgba(138,180,248,.35);transform:translateY(-1px)}
+.prompt-chip small{display:block;color:#7f8998;margin-top:5px}
+.composer-dock{
+  position:absolute;left:0;right:0;bottom:0;padding:18px 24px 22px;
+  background:linear-gradient(180deg,rgba(11,13,16,0),#0b0d10 22%);
+}
+.composer-wrap{max-width:790px;margin:0 auto}
+.composer{
+  display:flex;align-items:flex-end;gap:10px;padding:12px 13px 12px 18px;
+  border:1px solid #343a45;border-radius:25px;background:#1b1f26;
+  box-shadow:0 8px 35px rgba(0,0,0,.28);transition:.18s;
+}
+.composer:focus-within{border-color:#7189b6;box-shadow:0 0 0 3px rgba(138,180,248,.09),0 8px 35px rgba(0,0,0,.28)}
+.composer textarea{
+  flex:1;min-width:0;max-height:170px;min-height:30px;resize:none;
+  border:0;outline:0;background:transparent;color:#f1f3f7;
+  font:15px/1.55 Inter,system-ui,sans-serif;padding:5px 0;
+}
+.composer textarea::placeholder{color:#8b929e}
+.composer-tools{display:flex;align-items:center;gap:7px}
+.composer-tool{
+  width:36px;height:36px;border:0;border-radius:50%;background:transparent;
+  color:#b5bdc8;cursor:pointer;font-size:20px;
+}
+.composer-tool:hover{background:#303640}
+.send-btn{
+  width:42px;height:42px;border:0;border-radius:50%;display:grid;place-items:center;
+  background:#a8c7fa;color:#142238;cursor:pointer;transition:.18s;
+}
+.send-btn:hover{background:#c0d7ff;transform:scale(1.04)}
+.send-btn:disabled{opacity:.42;cursor:wait;transform:none}
+.composer-hint{text-align:center;color:#707987;font-size:11px;margin-top:10px}
+.thinking{display:flex;align-items:center;gap:9px;color:#dce5f5;font-weight:650}
+.thinking-dot{width:8px;height:8px;border-radius:50%;background:#9bbcf2;box-shadow:0 0 0 5px rgba(155,188,242,.1);animation:vPulse 1s infinite}
+.status-line{font-size:12px;color:#818b99;margin-top:5px}
+@keyframes vPulse{50%{opacity:.35;transform:scale(.8)}}
+.code-card{margin:15px 0;border:1px solid #343b47;border-radius:15px;overflow:hidden;background:#101319}
+.code-card-head{display:flex;align-items:center;justify-content:space-between;padding:10px 13px;background:#191e26;border-bottom:1px solid #303641}
+.code-lang{color:#aab8ce;font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.8px}
+.copy-code{border:0;border-radius:9px;padding:8px 12px;background:#d7e3f8;color:#182437;font-size:12px;font-weight:800;cursor:pointer}
+.code-card pre{margin:0;padding:16px;max-height:520px;overflow:auto;white-space:pre;color:#e7ebf2;font:12px/1.7 ui-monospace,SFMono-Regular,Consolas,monospace}
+.chat-error{color:#ff9c9c;background:rgba(255,80,80,.08);border:1px solid rgba(255,80,80,.16);padding:12px 14px;border-radius:12px}
+@media(max-width:850px){
+ .chat-shell{grid-template-columns:1fr;height:calc(100dvh - 62px)}
+ .chat-sidebar{display:none}
+ .chat-topbar{height:54px;padding:0 16px}
+ .chat-history{padding:24px 17px 145px}
+ .composer-dock{padding:12px 12px calc(14px + env(safe-area-inset-bottom))}
+ .chat-welcome{margin:8vh auto 28px}
+}
+@media(max-width:520px){
+ .navbar{height:62px;padding:0 12px}
+ .navbar .nav-actions{gap:0}
+ .navbar .btn-nav{font-size:11px;padding:8px 6px}
+ .navbar .logo{font-size:15px}
+ .navbar .logo-icon{width:32px;height:32px}
+ .chat-history{padding:20px 13px 142px}
+ .chat-row{gap:9px;margin-bottom:22px}
+ .chat-row .avatar{width:29px;height:29px;flex-basis:29px}
+ .bubble{font-size:14px;line-height:1.75}
+ .chat-row.user .bubble{max-width:84%}
+ .chat-welcome{margin:9vh auto 25px;padding:0 4px}
+ .chat-welcome h1{font-size:34px}
+ .prompt-grid{grid-template-columns:1fr 1fr;gap:8px;margin-top:24px}
+ .prompt-chip{padding:12px;min-height:80px;font-size:12px}
+ .composer{border-radius:21px;padding:9px 9px 9px 14px}
+ .composer textarea{font-size:14px}
+ .send-btn{width:40px;height:40px}
+ .composer-hint{font-size:10px}
+}
+
 </style>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -1894,221 +2031,272 @@ def logout():
 @login_required
 def chat():
     user = get_current_user()
-
     content = """
     <main class="chat-shell">
-      <div class="chat-history" id="chatHistory">
+      <aside class="chat-sidebar">
+        <button class="sidebar-new" type="button" onclick="newChat()">＋ <span>Yeni sohbet</span></button>
+        <div class="sidebar-label">Vantorium</div>
+        <a class="sidebar-link" href="/chat">✧ <span>Sohbet</span></a>
+        <a class="sidebar-link" href="/search">⌕ <span>Web'de ara</span></a>
+        <div class="sidebar-bottom">
+          <a class="sidebar-link" href="/dashboard">⚙ <span>Dashboard</span></a>
+          <a class="sidebar-link" href="/info">ⓘ <span>Kurallar ve bilgi</span></a>
+          <a class="sidebar-link" href="/logout">↪ <span>Çıkış yap</span></a>
+        </div>
+      </aside>
 
-        <div class="chat-row ai">
-          <div class="avatar">V</div>
-          <div class="bubble">
-            Merhaba! 👋 Ben Vantorium.
-            Web'de araştırabilir, kelimelerin anlamını bulabilir,
-            teknik sorularda GitHub'a bakabilir ve en uygun kısa cevabı
-            hazırlayabilirim.
+      <section class="chat-main">
+        <header class="chat-topbar">
+          <div class="chat-model">Vantorium <span class="model-pill">AI Asistan</span></div>
+          <div class="chat-top-actions">
+            <button class="top-icon" type="button" title="Yeni sohbet" onclick="newChat()">＋</button>
+          </div>
+        </header>
+
+        <div class="chat-history" id="chatHistory">
+          <section class="chat-welcome" id="welcomePanel">
+            <div class="welcome-kicker">Merhaba, """ + html.escape(user["username"]) + r""" 👋</div>
+            <h1>Bugün neye <span>bakalım?</span></h1>
+            <p class="welcome-sub">Sor, araştırayım. Kod iste, hazırlayayım. Birlikte çözelim.</p>
+            <div class="prompt-grid">
+              <button class="prompt-chip" onclick="usePrompt('Python ile gelişmiş bir Telegram botu kodu ver')">⌘ Kod oluştur<small>İhtiyacına uygun kod yaz</small></button>
+              <button class="prompt-chip" onclick="usePrompt('Yapay zekâ nasıl çalışır?')">✧ Bir konuyu öğren<small>Açık ve anlaşılır şekilde araştır</small></button>
+              <button class="prompt-chip" onclick="usePrompt('Bana modern bir web sitesi tasarla ve HTML kodunu ver')">▣ Web sitesi yap<small>HTML, CSS ve JavaScript</small></button>
+              <button class="prompt-chip" onclick="usePrompt('Bugün öğrenmeye değer 5 teknoloji konusu öner')">⌕ Fikir keşfet<small>Yeni konular ve öneriler</small></button>
+            </div>
+          </section>
+        </div>
+
+        <div class="composer-dock">
+          <div class="composer-wrap">
+            <form class="composer" id="chatForm">
+              <textarea id="chatInput" rows="1" placeholder="Vantorium'a bir şey sor..." autocomplete="off"></textarea>
+              <div class="composer-tools">
+                <button class="send-btn" id="sendBtn" type="submit" aria-label="Gönder">
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5"></path><path d="m5 12 7-7 7 7"></path></svg>
+                </button>
+              </div>
+            </form>
+            <div class="composer-hint">Vantorium hata yapabilir. Önemli bilgileri doğrulamayı unutma.</div>
           </div>
         </div>
-
-      </div>
-
-      <div class="chat-composer">
-        <div class="composer">
-          <input
-            id="chatInput"
-            type="text"
-            autocomplete="off"
-            placeholder="Vantorium'a bir şey sor..."
-          >
-          <button class="send-btn" id="sendBtn" onclick="sendChat()">
-            <svg width="19" height="19" viewBox="0 0 24 24"
-                 fill="none" stroke="currentColor"
-                 stroke-width="2.4" stroke-linecap="round"
-                 stroke-linejoin="round">
-              <path d="M12 19V5"></path>
-              <path d="M5 12l7-7 7 7"></path>
-            </svg>
-          </button>
-        </div>
-      </div>
+      </section>
     </main>
 
     <script>
-    const historyEl=document.getElementById("chatHistory");
-    const input=document.getElementById("chatInput");
-    const sendBtn=document.getElementById("sendBtn");
+    (() => {
+      const historyEl = document.getElementById("chatHistory");
+      const input = document.getElementById("chatInput");
+      const form = document.getElementById("chatForm");
+      const sendBtn = document.getElementById("sendBtn");
+      let sending = false;
 
-    input.focus();
-
-    input.addEventListener("keydown",(e)=>{
-      if(e.key==="Enter" && !e.shiftKey){
-        e.preventDefault();
-        sendChat();
+      function escapeHTML(value) {
+        return String(value).replace(/[&<>"']/g, ch => ({
+          "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;"
+        }[ch]));
       }
-    });
 
-    function esc(text){
-      const d=document.createElement("div");
-      d.textContent=text;
-      return d.innerHTML;
-    }
+      function scrollBottom() {
+        requestAnimationFrame(() => { historyEl.scrollTop = historyEl.scrollHeight; });
+      }
 
-    function addMessage(text,type){
-      const row=document.createElement("div");
-      row.className="chat-row "+type;
+      function hideWelcome() {
+        const welcome = document.getElementById("welcomePanel");
+        if (welcome) welcome.remove();
+      }
 
-      const avatar=document.createElement("div");
-      avatar.className="avatar";
-      avatar.textContent=type==="user"?"K":"V";
-
-      const bubble=document.createElement("div");
-      bubble.className="bubble";
-      bubble.textContent=text;
-
-      row.appendChild(avatar);
-      row.appendChild(bubble);
-      historyEl.appendChild(row);
-      historyEl.scrollTop=historyEl.scrollHeight;
-
-      return bubble;
-    }
-
-    function addThinking(){
-      const row=document.createElement("div");
-      row.className="chat-row ai";
-      row.id="thinkingRow";
-
-      row.innerHTML=`
-        <div class="avatar">V</div>
-        <div class="bubble">
-          <div class="thinking">
-            <span class="thinking-dot"></span>
-            <span id="thinkingText">Düşünüyor...</span>
-          </div>
-          <div class="status-line" id="thinkingSub">
-            Sorunu analiz ediyor
-          </div>
-        </div>
-      `;
-
-      historyEl.appendChild(row);
-      historyEl.scrollTop=historyEl.scrollHeight;
-      return row;
-    }
-
-    function setThinking(main,sub){
-      const a=document.getElementById("thinkingText");
-      const b=document.getElementById("thinkingSub");
-
-      if(a) a.textContent=main;
-      if(b) b.textContent=sub;
-    }
-
-    function removeThinking(){
-      const row=document.getElementById("thinkingRow");
-      if(row) row.remove();
-    }
-
-    function renderAnswer(text){
-      const blocks=[];
-      const placeholder="___VANTORIUM_CODE_";
-      let i=0;
-      text=String(text||"").replace(/```([a-zA-Z0-9+#_-]*)\\n?([\\s\\S]*?)```/g,(m,lang,code)=>{
-        const key=placeholder+(i++);
-        blocks.push({key,lang:lang||"code",code:code.replace(/^\\n|\\n$/g,"")});
-        return key;
-      });
-      let out=esc(text).replace(/[*][*](.*?)[*][*]/g,"<strong>$1</strong>").replace(/\n/g,"<br>");
-      blocks.forEach(block=>{
-        const codeHtml=`<div class="code-card"><div class="code-card-head"><span class="code-lang">${esc(block.lang)}</span><button class="copy-code" type="button">Kopyala</button></div><pre>${esc(block.code)}</pre></div>`;
-        out=out.replace(block.key,codeHtml);
-      });
-      return out;
-    }
-
-    async function sendChat(){
-      const text=input.value.trim();
-
-      if(!text || sendBtn.disabled) return;
-
-      input.value="";
-      sendBtn.disabled=true;
-
-      addMessage(text,"user");
-
-      const thinking=addThinking();
-
-      const looksLikeCode=/(\bkodu\b|\bkodunu\b|\bpython\b|\bhtml\b|\bjavascript\b|\bjs\b|\bphp\b|\bcss\b|\bgithub\b|\bkod vr\b|\bkdunu\b)/i.test(text);
-      const stages=looksLikeCode ? [
-        ["Düşünüyor...","Kod isteğini analiz ediyor"],
-        ["GitHub'da kod arıyor...","Uygun açık kaynak örneklerini tarıyor"],
-        ["Kodu inceliyor...","Dosya yapısını ve uygun bölümleri kontrol ediyor"],
-        ["En uygun kodu hazırlıyor...","Gereksiz kısımları ayıklıyor"],
-        ["Cevabı hazırlıyor...","Kopyalanabilir kod bloğunu oluşturuyor"]
-      ] : [
-        ["Düşünüyor...","Sorunun ne istediğini belirliyor"],
-        ["Web'de arıyor...","Uygun sonuçları tarıyor"],
-        ["Bilgileri inceliyor...","En alakalı bilgileri karşılaştırıyor"],
-        ["En uygun cevabı hazırlıyor...","Gereksiz bilgileri eliyor"]
-      ];
-
-      let stage=0;
-
-      const timer=setInterval(()=>{
-        stage=Math.min(stage+1,stages.length-1);
-        setThinking(stages[stage][0],stages[stage][1]);
-      },850);
-
-      try{
-        const response=await fetch("/api/chat",{
-          method:"POST",
-          headers:{"Content-Type":"application/json"},
-          body:JSON.stringify({message:text})
-        });
-
-        clearInterval(timer);
-
-        if(!response.ok){
-          throw new Error("HTTP "+response.status);
+      window.newChat = function() {
+        historyEl.innerHTML = document.getElementById("welcomeTemplate")?.innerHTML || "";
+        if (!historyEl.querySelector(".chat-welcome")) {
+          historyEl.innerHTML = `<section class="chat-welcome" id="welcomePanel">
+            <div class="welcome-kicker">Yeniden merhaba 👋</div>
+            <h1>Bugün neye <span>bakalım?</span></h1>
+            <p class="welcome-sub">Sor, araştırayım. Kod iste, hazırlayayım. Birlikte çözelim.</p>
+          </section>`;
         }
-
-        const data=await response.json();
-
-        removeThinking();
-
-        const bubble=addMessage(data.answer || "Cevap alınamadı.","ai");
-        bubble.innerHTML=renderAnswer(data.answer || "");
-        historyEl.scrollTop=historyEl.scrollHeight;
-
-        bubble.querySelectorAll(".copy-code").forEach(btn=>{
-          btn.addEventListener("click",async()=>{
-            const code=btn.closest(".code-card").querySelector("pre").textContent;
-            try{
-              await navigator.clipboard.writeText(code);
-              btn.textContent="Kopyalandı ✓";
-              setTimeout(()=>btn.textContent="Kopyala",1400);
-            }catch(e){
-              btn.textContent="Kopyalanamadı";
-              setTimeout(()=>btn.textContent="Kopyala",1400);
-            }
-          });
-        });
-
-      }catch(error){
-        clearInterval(timer);
-        removeThinking();
-        addMessage(
-          "Bağlantı sırasında bir hata oluştu. Birkaç saniye sonra tekrar dene.",
-          "ai"
-        );
-      }finally{
-        sendBtn.disabled=false;
+        input.value = "";
         input.focus();
+      };
+
+      window.usePrompt = function(value) {
+        input.value = value;
+        input.focus();
+        autoResize();
+      };
+
+      function autoResize() {
+        input.style.height = "auto";
+        input.style.height = Math.min(input.scrollHeight, 170) + "px";
       }
-    }
+      input.addEventListener("input", autoResize);
+      input.addEventListener("keydown", event => {
+        if (event.key === "Enter" && !event.shiftKey) {
+          event.preventDefault();
+          form.requestSubmit();
+        }
+      });
+
+      function addMessage(text, type) {
+        hideWelcome();
+        const row = document.createElement("div");
+        row.className = "chat-row " + type;
+        const avatar = document.createElement("div");
+        avatar.className = "avatar";
+        avatar.textContent = type === "user" ? "K" : "V";
+        const bubble = document.createElement("div");
+        bubble.className = "bubble";
+        bubble.textContent = text;
+        row.append(avatar, bubble);
+        historyEl.appendChild(row);
+        scrollBottom();
+        return bubble;
+      }
+
+      function addThinking() {
+        hideWelcome();
+        const row = document.createElement("div");
+        row.className = "chat-row ai";
+        row.id = "thinkingRow";
+        row.innerHTML = `<div class="avatar">V</div><div class="bubble">
+          <div class="thinking"><span class="thinking-dot"></span><span id="thinkingText">Düşünüyor...</span></div>
+          <div class="status-line" id="thinkingSub">Sorunu analiz ediyor</div>
+        </div>`;
+        historyEl.appendChild(row);
+        scrollBottom();
+      }
+
+      function setThinking(main, sub) {
+        const title = document.getElementById("thinkingText");
+        const detail = document.getElementById("thinkingSub");
+        if (title) title.textContent = main;
+        if (detail) detail.textContent = sub;
+      }
+
+      function renderAnswer(text) {
+        const codeBlocks = [];
+        const token = "VANTORIUM_CODE_BLOCK_";
+        let index = 0;
+        let safeText = String(text || "").replace(/```([a-zA-Z0-9+#_.-]*)\s*\n?([\s\S]*?)```/g, (match, lang, code) => {
+          const key = token + index++;
+          codeBlocks.push({key, lang:lang || "code", code:code.replace(/^\n|\n$/g, "")});
+          return key;
+        });
+        let output = escapeHTML(safeText)
+          .replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>")
+          .replace(/`([^`]+)`/g, "<code>$1</code>")
+          .replace(/\n/g, "<br>");
+        for (const block of codeBlocks) {
+          const codeHTML = `<div class="code-card">
+            <div class="code-card-head"><span class="code-lang">${escapeHTML(block.lang)}</span>
+            <button class="copy-code" type="button">Kopyala</button></div>
+            <pre><code>${escapeHTML(block.code)}</code></pre></div>`;
+          output = output.replace(block.key, codeHTML);
+        }
+        return output;
+      }
+
+      async function sendChat() {
+        const message = input.value.trim();
+        if (!message || sending) return;
+        sending = true;
+        sendBtn.disabled = true;
+        input.value = "";
+        autoResize();
+        addMessage(message, "user");
+        addThinking();
+
+        const codeIntent = /(kod|python|html|javascript|php|css|github)/i.test(message);
+        const stages = codeIntent ? [
+          ["Düşünüyor...","İsteğini ve programlama dilini belirliyor"],
+          ["GitHub'da arıyor...","Uygun açık kaynak kodlarını kontrol ediyor"],
+          ["Kodu inceliyor...","İhtiyaca en yakın örneği seçiyor"],
+          ["Cevabı hazırlıyor...","Kod bloğunu ve kopyalama alanını hazırlıyor"]
+        ] : [
+          ["Düşünüyor...","Sorunun ne istediğini anlamaya çalışıyor"],
+          ["Web'de arıyor...","İlgili bilgileri araştırıyor"],
+          ["Bilgileri inceliyor...","Sonuçları karşılaştırıyor"],
+          ["Cevabı hazırlıyor...","En uygun yanıtı oluşturuyor"]
+        ];
+        let stage = 0;
+        setThinking(stages[0][0], stages[0][1]);
+        const timer = setInterval(() => {
+          stage = Math.min(stage + 1, stages.length - 1);
+          setThinking(stages[stage][0], stages[stage][1]);
+        }, 1300);
+
+        try {
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), 90000);
+          let response;
+          try {
+            response = await fetch("/api/chat", {
+              method:"POST",
+              credentials:"same-origin",
+              headers:{"Content-Type":"application/json","Accept":"application/json"},
+              body:JSON.stringify({message}),
+              signal:controller.signal
+            });
+          } finally {
+            clearTimeout(timeout);
+          }
+
+          const raw = await response.text();
+          let data;
+          try { data = JSON.parse(raw); }
+          catch (_) { throw new Error("Sunucudan geçerli JSON yanıtı alınamadı: " + raw.slice(0,180)); }
+          if (!response.ok) throw new Error(data.error || data.answer || ("HTTP " + response.status));
+          if (!data || typeof data.answer !== "string" || !data.answer.trim()) {
+            throw new Error("Sunucu boş yanıt döndürdü.");
+          }
+
+          clearInterval(timer);
+          const thinking = document.getElementById("thinkingRow");
+          if (thinking) thinking.remove();
+          const bubble = addMessage("", "ai");
+          bubble.innerHTML = renderAnswer(data.answer);
+
+          bubble.querySelectorAll(".copy-code").forEach(button => {
+            button.addEventListener("click", async () => {
+              const code = button.closest(".code-card").querySelector("pre code").textContent;
+              try {
+                await navigator.clipboard.writeText(code);
+                button.textContent = "Kopyalandı ✓";
+              } catch (_) {
+                const area = document.createElement("textarea");
+                area.value = code; document.body.appendChild(area); area.select();
+                document.execCommand("copy"); area.remove();
+                button.textContent = "Kopyalandı ✓";
+              }
+              setTimeout(() => button.textContent = "Kopyala", 1600);
+            });
+          });
+        } catch (error) {
+          clearInterval(timer);
+          const thinking = document.getElementById("thinkingRow");
+          if (thinking) thinking.remove();
+          const detail = error.name === "AbortError"
+            ? "İstek zaman aşımına uğradı. Biraz daha kısa bir istekle tekrar dene."
+            : (error.message || "Bilinmeyen bağlantı hatası.");
+          const bubble = addMessage("Yanıt alınamadı. " + detail, "ai");
+          bubble.classList.add("chat-error");
+        } finally {
+          sending = false;
+          sendBtn.disabled = false;
+          input.focus();
+        }
+      }
+
+      form.addEventListener("submit", event => {
+        event.preventDefault();
+        sendChat();
+      });
+      input.focus();
+    })();
     </script>
     """
-
     return render_page("Sohbet", content, user)
+
 
 @app.route("/api/chat", methods=["POST"])
 @login_required
@@ -2117,17 +2305,29 @@ def api_chat():
     message = str(data.get("message", "")).strip()
 
     if not message:
+        return jsonify({"error": "Bir mesaj yazmalısın.", "answer": ""}), 400
+
+    if len(message) > 6000:
+        return jsonify({"error": "Mesaj çok uzun. En fazla 6000 karakter gönderebilirsin.", "answer": ""}), 413
+
+    try:
+        answer, source = get_answer(message)
+        if not isinstance(answer, str) or not answer.strip():
+            answer = "İsteğini işledim ancak boş yanıt oluştu. Bir kez daha dener misin?"
+            source = "fallback"
+        return jsonify({"answer": answer, "source": source})
+    except requests.RequestException as exc:
+        app.logger.exception("Chat request network error")
         return jsonify({
-            "answer": "Bir mesaj yazmalısın.",
-            "source": "sistem"
-        }), 400
-
-    answer, source = get_answer(message)
-
-    return jsonify({
-        "answer": answer,
-        "source": source
-    })
+            "answer": "Araştırma servislerine şu anda ulaşılamıyor. Biraz sonra tekrar dene.",
+            "source": "network_error"
+        }), 200
+    except Exception:
+        app.logger.exception("Unhandled /api/chat error")
+        return jsonify({
+            "answer": "Yanıt hazırlanırken sunucu tarafında bir hata oluştu. Lütfen tekrar dene.",
+            "source": "server_error"
+        }), 200
 
 # =========================================================
 # SEARCH ENGINE
