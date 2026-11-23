@@ -21,7 +21,7 @@ from threading import Lock
 from flask import Flask, request, jsonify, Response, redirect, make_response, render_template_string, session, send_from_directory, send_file, g
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("AgHa3uhKwpLmnw!jduUs", secrets.token_hex(32))
+app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=30)
@@ -313,7 +313,23 @@ DATASET = load_dataset()
 GREETING_RE = re.compile(
     r"^\s*(selam|selamün aleyküm|selamun aleykum|merhaba|"
     r"hello|hi|hey|günaydın|iyi akşamlar|iyi geceler|"
-    r"naber|nbr|nasılsın|sa|s.a)\s*[!.?]*\s*$",
+    r"naber|nbr|nasılsın|sa|s\.a|selam kral|selam abim|"
+    r"naber kral|naber ya|naber ya kral|ne haber|ne haber kral|"
+    r"nasıl gidiyor|nasilsin|naber lan|selamlar)\s*[!.?]*\s*$",
+    re.I
+)
+
+# Kısa sohbet / muhabbet — web aramasına gitmesin
+SMALLTALK_RE = re.compile(
+    r"^\s*("
+    r"naber.*|ne haber.*|nasıl(sın|sin)?.*|iyi misin.*|"
+    r"ne yapıyorsun|ne yapıyosun|napıyorsun|napıyosun|"
+    r"teşekkür(ler)?|sağol|sagol|eyvallah|eyv|"
+    r"tamam|ok|okey|anladım|süper|harika|güzel|"
+    r"kimsin|sen kimsin|ne iş yapıyorsun|ne yapabilirsin|"
+    r"yardım et|yardımcı ol|bana yardım|"
+    r"kral|abi|kardes|kardeş|lan|ya kral|ya abi"
+    r")\s*[!.?]*\s*$",
     re.I
 )
 
@@ -333,12 +349,19 @@ RESPONSE_RE = re.compile(
 
 def analyze_query(query):
     q = normalize(query)
+    raw = (query or "").strip()
 
     return {
-        "is_greeting": bool(GREETING_RE.match(query or "")),
+        "is_greeting": bool(GREETING_RE.match(raw)),
+        "is_smalltalk": bool(SMALLTALK_RE.match(raw)) or (
+            len(raw.split()) <= 5 and bool(re.search(
+                r"\b(naber|nasıl|nasilsin|selam|kral|teşekkür|sağol|eyvallah|"
+                r"napıyo|ne haber|iyi misin|kimsin)\b", q, re.I
+            ))
+        ),
         "is_math": bool(
-            re.fullmatch(r"[\d\s+\-*/().,%^]+", query or "")
-            and re.search(r"[+\-*/%^]", query or "")
+            re.fullmatch(r"[\d\s+\-*/().,%^]+", raw)
+            and re.search(r"[+\-*/%^]", raw)
         ),
         "is_code": bool(re.search(
             r"\b(kod|python|php|javascript|js|html|css|api|"
@@ -346,8 +369,8 @@ def analyze_query(query):
             q
         )) or is_code_request(query),
         "is_code_request": is_code_request(query),
-        "is_definition": bool(DEFINITION_RE.match(query or "")),
-        "is_response_advice": bool(RESPONSE_RE.search(query or "")),
+        "is_definition": bool(DEFINITION_RE.match(raw)),
+        "is_response_advice": bool(RESPONSE_RE.search(raw)),
         "is_recommendation": bool(re.search(
             r"\b(öner|önerir misin|tavsiye et|fikir ver|konu öner|"
             r"kaç tane.*öner|\d+.*(konu|fikir|teknoloji).*(öner|listele))\b",
@@ -1060,13 +1083,13 @@ def synthesize_answer(query, results, parts):
         return f"**{target}**: {snippets[0]}"
     if parts.get("is_response_advice"):
         return (
-            "Bu ifadeye verebileceğin kısa cevap: **“Anladım, biraz daha açar mısın?”**\\n\\n"
-            "Daha samimi bir seçenek: **“Neden öyle düşünüyorsun?”**\\n\\n"
+            "Bu ifadeye verebileceğin kısa cevap: **“Anladım, biraz daha açar mısın?”**\n\n"
+            "Daha samimi bir seçenek: **“Neden öyle düşünüyorsun?”**\n\n"
             f"Arama sonuçlarından ilgili bilgi: {snippets[0]}"
         )
     sentences = []
     for snippet in snippets:
-        for sentence in re.split(r"(?<=[.!?])\\s+", snippet):
+        for sentence in re.split(r"(?<=[.!?])\s+", snippet):
             sentence = sentence.strip(" -•")
             if len(sentence) >= 35 and normalize(sentence) not in {normalize(x) for x in sentences}:
                 sentences.append(sentence)
@@ -1077,8 +1100,8 @@ def synthesize_answer(query, results, parts):
     if not sentences:
         sentences = snippets[:2]
     return (
-        f"**{query.strip()}** hakkında bulabildiğim bilgilerin özeti:\\n\\n"
-        + "\\n\\n".join(sentences[:4])
+        f"**{query.strip()}** hakkında bulabildiğim bilgilerin özeti:\n\n"
+        + "\n\n".join(sentences[:4])
     )
 
 def search_everywhere(query, parts=None):
@@ -1220,22 +1243,54 @@ def recommendation_answer(query):
     q = normalize(query)
     if re.search(r"teknoloji|technology|teknolojik", q):
         return (
-            "Bugün öğrenmeye değer 5 teknoloji konusu:\\n\\n"
+            "Bugün öğrenmeye değer 5 teknoloji konusu:\n\n"
             "1. **Yapay zekâ ajanları:** Araç kullanabilen ve çok adımlı işleri "
-            "tamamlayabilen akıllı sistemler.\\n\\n"
+            "tamamlayabilen akıllı sistemler.\n\n"
             "2. **Siber güvenlik:** Kimlik avı, veri sızıntısı ve güvenli yazılım "
-            "geliştirme yöntemleri.\\n\\n"
+            "geliştirme yöntemleri.\n\n"
             "3. **Kuantum bilişim:** Kuantum bilgisayarların çalışma mantığı "
-            "ve kullanım alanları.\\n\\n"
+            "ve kullanım alanları.\n\n"
             "4. **Robotik ve otonom sistemler:** Sensörler, bilgisayarlı görü "
-            "ve kendi kararlarını verebilen makineler.\\n\\n"
+            "ve kendi kararlarını verebilen makineler.\n\n"
             "5. **Edge AI:** Yapay zekânın bulut yerine telefon ve diğer "
-            "cihazların üzerinde çalıştırılması.\\n\\n"
+            "cihazların üzerinde çalıştırılması.\n\n"
             "**Başlangıç önerim:** Python temeliyle küçük bir yapay zekâ "
             "asistanı geliştirerek başla.",
             "öneri"
         )
     return None
+
+
+def smalltalk_answer(query):
+    q = normalize(query)
+    if re.search(r"\b(teşekkür|sağol|sagol|eyvallah|eyv)\b", q):
+        return random.choice([
+            "Rica ederim 🙌 Başka bir şey var mı?",
+            "Ne demek, buradayım.",
+            "Her zaman. Devam edelim mi?"
+        ])
+    if re.search(r"\b(kimsin|sen kimsin|ne iş|ne yapabilirsin)\b", q):
+        return (
+            "Ben Vantorium — araştırma, kod ve fikir asistanınım.\n"
+            "Web'de arar, kod yazar, konular anlatırım. Ne yapmak istersin?"
+        )
+    if re.search(r"\b(naber|ne haber|nasıl|nasilsin|iyi misin|napıyo)\b", q):
+        return random.choice([
+            "İyiyim kral 😎 Sen nasılsın? Ne yapalım?",
+            "Buradayım, hazırım. Söyle neye bakıyoruz.",
+            "Her şey yolunda. Kod mu, araştırma mı, yoksa sohbet mi?"
+        ])
+    if re.search(r"\b(selam|merhaba|hello|hi)\b", q):
+        return random.choice([
+            "Selam! 👋 Ne yapmak istiyorsun?",
+            "Merhaba kral. Hazırım, yaz gelsin.",
+            "Selam! Sorunu yaz, birlikte çözelim."
+        ])
+    return random.choice([
+        "Anladım. Ne üzerinde çalışmak istersin?",
+        "Tamam, buradayım. Detay verirsen daha iyi yardımcı olurum.",
+        "Peki. Kod, araştırma ya da fikir — ne diyorsun?"
+    ])
 
 
 def get_answer(query):
@@ -1245,12 +1300,8 @@ def get_answer(query):
 
     parts = analyze_query(query)
 
-    if parts["is_greeting"]:
-        return random.choice([
-            "Selam! 👋 Ben Vantorium. Ne yapmak istiyorsun?",
-            "Merhaba! Hazırım. Sorunu yaz, birlikte çözelim.",
-            "Selam kral 😎 Ne üzerinde çalışıyoruz?"
-        ]), "selamlama"
+    if parts["is_greeting"] or parts.get("is_smalltalk"):
+        return smalltalk_answer(query), "sohbet"
 
     if parts["is_math"]:
         try:
@@ -1268,7 +1319,6 @@ def get_answer(query):
             return recommendation
 
     if parts.get("is_code_request"):
-        # user_id varsa dosya sahipliği için geçeriz
         uid = None
         try:
             u = get_current_user()
@@ -1291,7 +1341,10 @@ def get_answer(query):
         memory_save(normalized, local_fact, 0.90, "yerel_bilgi")
         return local_fact, "yerel_bilgi"
 
-    # Search is used only as a source of facts; no third-party AI is called.
+    # Çok kısa / anlamsız sorguları web'e gönderme
+    if len(query.split()) <= 2 and not parts.get("is_definition"):
+        return smalltalk_answer(query), "sohbet"
+
     results = search_everywhere(query, parts)
     answer = synthesize_answer(query, results, parts)
     if answer:
@@ -1649,142 +1702,7 @@ input:focus{
   font-size:12px;
 }
 
-/* CHAT */
-
-.chat-shell{
-  height:calc(100vh - 68px);
-  display:flex;
-  flex-direction:column;
-}
-
-.chat-history{
-  flex:1;
-  overflow-y:auto;
-  padding:30px 16px 24px;
-  width:min(920px,100%);
-  margin:auto;
-}
-
-.chat-row{
-  display:flex;
-  gap:12px;
-  max-width:860px;
-  margin:0 auto 28px;
-  align-items:flex-start;
-}
-
-.chat-row.user{
-  flex-direction:row-reverse;
-}
-
-.avatar{
-  flex:0 0 38px;
-  width:38px;
-  height:38px;
-  border-radius:13px;
-  display:grid;
-  place-items:center;
-  font-size:13px;
-  font-weight:900;
-  background:#1a222d;
-}
-
-.chat-row.ai .avatar{
-  background:linear-gradient(135deg,#1ce0a5,#09ae7e);
-  color:#03130e;
-  box-shadow:0 8px 24px rgba(22,211,154,.15);
-}
-
-.bubble{
-  max-width:calc(100% - 50px);
-  line-height:1.75;
-  font-size:15px;
-  color:#e9edf2;
-  white-space:pre-wrap;
-}
-
-.chat-row.user .bubble{
-  background:#151c25;
-  border:1px solid rgba(255,255,255,.05);
-  padding:11px 15px;
-  border-radius:17px 5px 17px 17px;
-}
-
-.chat-row.ai .bubble{
-  padding-top:2px;
-}
-
-.thinking{
-  display:flex;
-  align-items:center;
-  gap:9px;
-  color:#8e99a8;
-  font-size:13px;
-}
-
-.thinking-dot{
-  width:7px;
-  height:7px;
-  border-radius:50%;
-  background:var(--green);
-  box-shadow:0 0 16px rgba(22,211,154,.5);
-  animation:pulse 1s infinite;
-}
-
-@keyframes pulse{
-  0%,100%{opacity:.25;transform:scale(.8)}
-  50%{opacity:1;transform:scale(1)}
-}
-
-.status-line{
-  color:#8c98a8;
-  font-size:12px;
-  margin-top:7px;
-}
-
-.chat-composer{
-  width:min(920px,100%);
-  margin:auto;
-  padding:10px 16px 24px;
-}
-
-.composer{
-  position:relative;
-  background:rgba(14,20,28,.95);
-  border:1px solid rgba(255,255,255,.1);
-  border-radius:18px;
-  box-shadow:0 18px 60px rgba(0,0,0,.4);
-  padding:7px;
-}
-
-.composer input{
-  width:100%;
-  padding:14px 55px 14px 15px;
-  border:0;
-  outline:0;
-  background:transparent;
-  color:white;
-}
-
-.send-btn{
-  position:absolute;
-  right:7px;
-  top:7px;
-  width:43px;
-  height:43px;
-  border:0;
-  border-radius:13px;
-  background:var(--green);
-  color:#03130e;
-  display:grid;
-  place-items:center;
-  cursor:pointer;
-}
-
-.send-btn:disabled{
-  opacity:.45;
-  cursor:not-allowed;
-}
+/* Eski chat stilleri kaldırıldı — Gemini bloğu kullanılıyor */
 
 /* SEARCH */
 
@@ -2048,13 +1966,18 @@ input:focus{
 /* ========== GEMINI-STYLE CHAT UI ========== */
 .chat-shell{
   height:100dvh;
-  min-height:520px;
+  height:100vh;
+  min-height:100dvh;
   display:grid;
   grid-template-columns:260px minmax(0,1fr);
   background:#0b0d10;
   overflow:hidden;
+  position:fixed;
+  inset:0;
+  z-index:50;
 }
-body:has(.chat-shell){margin:0;overflow:hidden}
+body:has(.chat-shell){margin:0;overflow:hidden;height:100%;position:fixed;width:100%}
+html:has(.chat-shell){overflow:hidden;height:100%}
 .chat-sidebar{
   border-right:1px solid rgba(255,255,255,.07);
   background:#101216;
@@ -2077,7 +2000,12 @@ body:has(.chat-shell){margin:0;overflow:hidden}
   transition:.15s;
 }
 .sidebar-bottom{margin-top:auto;display:grid;gap:4px;padding-top:12px;border-top:1px solid rgba(255,255,255,.06)}
-.chat-main{min-width:0;display:flex;flex-direction:column;position:relative;background:#0b0d10}
+.chat-main{
+  min-width:0;min-height:0;
+  display:flex;flex-direction:column;
+  position:relative;background:#0b0d10;
+  height:100%;overflow:hidden;
+}
 .chat-topbar{
   height:56px;flex-shrink:0;display:flex;align-items:center;
   justify-content:space-between;padding:0 22px;
@@ -2096,10 +2024,19 @@ body:has(.chat-shell){margin:0;overflow:hidden}
 }
 .top-icon:hover{background:#20242b;color:#fff}
 .chat-history{
-  flex:1;min-height:0;overflow:auto;padding:28px 20px 160px;
+  flex:1 1 auto;
+  min-height:0;
+  overflow-y:auto !important;
+  overflow-x:hidden;
+  -webkit-overflow-scrolling:touch;
+  overscroll-behavior:contain;
+  padding:28px 20px 160px;
   width:100%;max-width:860px;margin:0 auto;
   scrollbar-width:thin;scrollbar-color:#343943 transparent;
+  touch-action:pan-y;
 }
+.chat-history::-webkit-scrollbar{width:6px}
+.chat-history::-webkit-scrollbar-thumb{background:#343943;border-radius:6px}
 .chat-row{
   display:flex;align-items:flex-start;gap:12px;
   margin:0 auto 22px;max-width:760px;width:100%;
