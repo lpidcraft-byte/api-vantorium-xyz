@@ -171,7 +171,8 @@ def analyze_query(query):
             r"\b(kod|python|php|javascript|js|html|css|api|"
             r"flask|discord|telegram|github|programlama|hata|error|debug)\b",
             q
-        )),
+        )) or is_code_request(query),
+        "is_code_request": is_code_request(query),
         "is_definition": bool(DEFINITION_RE.match(query or "")),
         "is_response_advice": bool(RESPONSE_RE.search(query or "")),
     }
@@ -551,6 +552,210 @@ def best_results(results, query, limit=6):
     return results[:limit]
 
 # =========================================================
+# CODE REQUEST INTELLIGENCE
+# =========================================================
+
+CODE_END_RE = re.compile(
+    r"(?:\b(?:kodu|kodunu|python kodu|python kodunu|python|html kodu|html kodunu|html|css kodu|javascript kodu|js kodu|php kodu|java kodu|sql kodu|bash kodu|kdunu|kod vr|kodu vr|kodunu vr|python vr|html kdu vr)\b)\s*(?:ver|vr|yap|yaz|oluştur|gönder)?\s*[.!?]*$",
+    re.I
+)
+
+CODE_LANG_RE = [
+    ("python", re.compile(r"\bpython\b|\.py\b", re.I)),
+    ("html", re.compile(r"\bhtml\b|\.html?\b", re.I)),
+    ("css", re.compile(r"\bcss\b|\.css\b", re.I)),
+    ("javascript", re.compile(r"\bjavascript\b|\bjs\b|\.js\b", re.I)),
+    ("php", re.compile(r"\bphp\b|\.php\b", re.I)),
+    ("java", re.compile(r"\bjava\b|\.java\b", re.I)),
+    ("csharp", re.compile(r"\bc#\b|\bcsharp\b|\.cs\b", re.I)),
+    ("cpp", re.compile(r"\bc\+\+\b|\bcpp\b|\.cpp\b", re.I)),
+    ("sql", re.compile(r"\bsql\b|\.sql\b", re.I)),
+    ("bash", re.compile(r"\bbash\b|\bshell\b|\.sh\b", re.I)),
+]
+
+DANGEROUS_CODE_RE = re.compile(
+    r"\b(ddos|dos attack|botnet|ransomware|credential stealer|keylogger|malware|trojan|virus|reverse shell|steal cookies|cookie stealer|password stealer|token stealer|phishing kit)\b",
+    re.I
+)
+
+def is_code_request(query):
+    q = normalize(query)
+    if CODE_END_RE.search(q):
+        return True
+    return bool(re.search(r"\b(kodu|kodunu|kod|kdunu|kodu vr|kodunu vr|python vr|html kdu vr)\b", q, re.I))
+
+def detect_code_language(query):
+    for language, pattern in CODE_LANG_RE:
+        if pattern.search(query or ""):
+            return language
+    return "python"
+
+def code_request_subject(query):
+    q = query or ""
+    q = re.sub(
+        r"\b(?:bana|bir|bir tane|şu|bunun|bunu|lütfen|kodunu|kodu|kod|python|html|css|javascript|js|php|java|c\+\+|c#|sql|bash|kdunu|vr|ver|yap|yaz|oluştur|gönder)\b",
+        " ", q, flags=re.I
+    )
+    q = re.sub(r"\s+", " ", q).strip(" .,!?:;-_")
+    return q or "genel örnek uygulama"
+
+def github_repo_code_search(query, language="python", num_repos=4):
+    try:
+        repo_query = query + (f" language:{language}" if language else "")
+        r = requests.get(
+            "https://api.github.com/search/repositories",
+            params={"q": repo_query, "sort": "stars", "order": "desc", "per_page": num_repos},
+            headers={"Accept": "application/vnd.github+json", "User-Agent": "VantoriumAI/6.0"},
+            timeout=12
+        )
+        if r.status_code != 200:
+            return []
+        candidates = []
+        for repo in r.json().get("items", []):
+            owner = repo.get("owner", {}).get("login", "")
+            name = repo.get("name", "")
+            branch = repo.get("default_branch", "main") or "main"
+            if not owner or not name:
+                continue
+            try:
+                tree_r = requests.get(
+                    f"https://api.github.com/repos/{owner}/{name}/git/trees/{urllib.parse.quote(branch, safe='')}",
+                    params={"recursive": "1"},
+                    headers={"Accept": "application/vnd.github+json", "User-Agent": "VantoriumAI/6.0"},
+                    timeout=12
+                )
+                if tree_r.status_code != 200:
+                    continue
+                tree = tree_r.json().get("tree", [])
+            except Exception:
+                continue
+            extensions = {
+                "python": (".py",), "html": (".html", ".htm"), "css": (".css",),
+                "javascript": (".js", ".mjs"), "php": (".php",), "java": (".java",),
+                "csharp": (".cs",), "cpp": (".cpp", ".cc", ".h", ".hpp"),
+                "sql": (".sql",), "bash": (".sh",),
+            }.get(language, (".py",))
+            files = [x for x in tree if x.get("type") == "blob" and x.get("path", "").lower().endswith(extensions)]
+            files = sorted(files, key=lambda x: (0 if any(k in x.get("path", "").lower() for k in ("main", "app", "index", "server")) else 1, len(x.get("path", ""))))
+            for file_item in files[:3]:
+                path = file_item.get("path", "")
+                raw_url = f"https://raw.githubusercontent.com/{owner}/{name}/{urllib.parse.quote(branch, safe='')}/{path}"
+                try:
+                    code_r = requests.get(raw_url, headers={"User-Agent": "VantoriumAI/6.0"}, timeout=12)
+                    if code_r.status_code != 200:
+                        continue
+                    code = code_r.text
+                    if not code.strip() or len(code) < 20:
+                        continue
+                    if len(code) > 14000:
+                        code = code[:14000] + "\n# ... dosya kısaltıldı ..."
+                    candidates.append({
+                        "title": f"{owner}/{name} — {path}",
+                        "url": raw_url,
+                        "repo_url": repo.get("html_url", ""),
+                        "snippet": repo.get("description") or "GitHub kodu",
+                        "code": code,
+                        "language": language,
+                        "stars": repo.get("stargazers_count", 0),
+                        "source": "GitHub",
+                    })
+                except Exception:
+                    continue
+            if len(candidates) >= 5:
+                break
+        return candidates
+    except Exception:
+        return []
+
+def generate_code_fallback(query, language):
+    subject = code_request_subject(query)
+    safe_subject = re.sub(r"[^a-zA-Z0-9_ -]", "", subject).strip()[:60] or "Vantorium"
+    if language == "html":
+        return f'''<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{html.escape(safe_subject)}</title>
+  <style>
+    *{{box-sizing:border-box}}body{{margin:0;font-family:Inter,Arial,sans-serif;background:#080b10;color:#fff;display:grid;place-items:center;min-height:100vh;padding:24px}}
+    .card{{width:min(720px,100%);padding:32px;border:1px solid #24303d;border-radius:20px;background:#101720;box-shadow:0 25px 80px #0008}}
+    button{{border:0;border-radius:12px;padding:12px 18px;background:#16d39a;color:#03130e;font-weight:800;cursor:pointer}}
+  </style>
+</head>
+<body>
+  <main class="card">
+    <h1>{html.escape(safe_subject)}</h1>
+    <p>Vantorium tarafından oluşturulan başlangıç arayüzü.</p>
+    <button onclick="alert('Hazır!')">Başlat</button>
+  </main>
+</body>
+</html>'''
+    if language == "javascript":
+        return f'''// {safe_subject}
+const app = {{
+  name: {safe_subject!r},
+  start() {{
+    console.log(`${{this.name}} hazır.`);
+  }}
+}};
+
+app.start();
+'''
+    if language == "php":
+        return f'''<?php
+// {safe_subject}
+declare(strict_types=1);
+header('Content-Type: application/json; charset=utf-8');
+echo json_encode([
+    'ok' => true,
+    'message' => '{safe_subject}',
+], JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
+'''
+    if language == "sql":
+        escaped = safe_subject.replace("'", "''")
+        return f'''-- {safe_subject}
+CREATE TABLE IF NOT EXISTS vantorium_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+INSERT INTO vantorium_items (name) VALUES ('{escaped}');
+SELECT * FROM vantorium_items ORDER BY id DESC;
+'''
+    if language == "bash":
+        return f'''#!/usr/bin/env bash
+set -euo pipefail
+# {safe_subject}
+echo "{safe_subject} hazır."
+'''
+    return f'''#!/usr/bin/env python3
+# {safe_subject} — Vantorium tarafından oluşturulan başlangıç.
+
+from __future__ import annotations
+
+
+def main() -> None:
+    print({safe_subject!r})
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+def code_response(query):
+    language = detect_code_language(query)
+    if DANGEROUS_CODE_RE.search(query):
+        return ("Bu istek saldırı/zararlı yazılım koduna giriyorsa onu GitHub'dan çekip veremem. Kendi sistemini test ediyorsan güvenli bir yük testi veya laboratuvar örneği hazırlayabilirim.", "guvenlik")
+    subject = code_request_subject(query)
+    candidates = github_repo_code_search(subject, language)
+    if candidates:
+        best = candidates[0]
+        return (f"İstediğin koda uygun bir GitHub örneği buldum.\n\nDosya: {best.get('title', 'GitHub')}\n\n```{language}\n{best['code']}\n```", "github_kod")
+    generated = generate_code_fallback(query, language)
+    return (f"GitHub'da doğrudan uygun bir örnek bulamadım. İstediğin şeye uygun bir başlangıç kodu oluşturdum.\n\n```{language}\n{generated}\n```", "uretilen_kod")
+
+# =========================================================
 # SMART ANSWER
 # =========================================================
 
@@ -599,114 +804,62 @@ def clean_snippet(text, max_len=420):
 def synthesize_answer(query, results, parts):
     if not results:
         return None
-
-    results = best_results(results, query, 6)
-
+    results = best_results(results, make_search_query(query, parts), 6)
     target = extract_target(query, parts)
-
-    # Definition: concise, direct answer.
     if parts["is_definition"]:
         for result in results:
-            snippet = clean_snippet(result.get("snippet", ""), 500)
+            snippet = clean_snippet(result.get("snippet", ""), 650)
             if snippet:
-                return (
-                    f"{target} şu anlama gelir: {snippet}\n\n"
-                    f"Kaynak: {result.get('url', '')}"
-                )
-
-    # "Biri bana X derse ne demeliyim?"
+                return f"{target} şu anlama gelir: {snippet}"
     if parts["is_response_advice"]:
         for result in results:
-            snippet = clean_snippet(result.get("snippet", ""), 350)
-
+            snippet = clean_snippet(result.get("snippet", ""), 420)
             if snippet:
-                return (
-                    f"{target} ifadesine vereceğin cevap, "
-                    f"bağlama göre değişir. İnternetteki en uygun "
-                    f"bilgiye göre: {snippet}\n\n"
-                    f"Kaynak: {result.get('url', '')}"
-                )
-
-    # Normal search: one good result, not a dump.
+                return f"{target} ifadesine verilebilecek en uygun kısa cevap: {snippet}"
     first = results[0]
-    snippet = clean_snippet(first.get("snippet", ""), 550)
-
-    if snippet:
-        return (
-            f"{snippet}\n\n"
-            f"Kaynak: {first.get('url', '')}"
-        )
-
-    return f"İlgili sonuç: {first.get('url', '')}"
+    snippet = clean_snippet(first.get("snippet", ""), 700)
+    return snippet or "Arama sonucu bulundu ama okunabilir bir açıklama alınamadı."
 
 def search_everywhere(query, parts=None):
     if parts is None:
         parts = analyze_query(query)
-
     search_query = make_search_query(query, parts)
-
     google_results = cse_search(search_query, "web", 6)
-
-    github_results = []
-    if parts["is_code"]:
-        github_results = github_search(search_query, 5)
-
     wiki_results = wikipedia_search(search_query, 3)
-
-    all_results = (
-        google_results
-        + github_results
-        + wiki_results
-    )
-
-    return best_results(all_results, search_query, 8)
+    github_results = github_search(search_query, 5) if parts.get("is_code") else []
+    return best_results(google_results + github_results + wiki_results, search_query, 8)
 
 def get_answer(query):
     query = (query or "").strip()
-
     if not query:
         return "Bir şeyler yaz, birlikte bakalım.", "sistem"
-
     parts = analyze_query(query)
-
-    # Greeting must NOT trigger search.
     if parts["is_greeting"]:
         return random.choice([
             "Selam! 👋 Ben Vantorium. Ne arıyoruz?",
             "Merhaba! Hazırım. Sorunu yaz, araştırıp en uygun cevabı vereyim.",
             "Selam kral 😎 Ne hakkında araştırma yapalım?"
         ]), "selamlama"
-
     if parts["is_math"]:
         try:
-            result = safe_math(query)
-            return f"Sonuç: {result}", "matematik"
+            return f"Sonuç: {safe_math(query)}", "matematik"
         except Exception:
             return "Bu matematik ifadesini güvenli şekilde çözemedim.", "hata"
-
+    if parts.get("is_code_request"):
+        return code_response(query)
     normalized = normalize(query)
-
     if normalized in DATASET and DATASET[normalized]:
         return random.choice(DATASET[normalized]), "veri_seti"
-
     cached = memory_get(normalized)
-    if cached:
+    if cached and "Kaynak:" not in cached and not re.search(r"https?://", cached):
         return cached, "hafiza"
-
     results = search_everywhere(query, parts)
-
     if results:
         answer = synthesize_answer(query, results, parts)
-
         if answer:
             memory_save(normalized, answer, 0.86, "web")
             return answer, "web"
-
-    return (
-        "Aradım ama güvenilir ve yeterli bir sonuç bulamadım. "
-        "İstersen soruyu biraz daha açık yaz.",
-        "bulunamadi"
-    )
+    return "Aradım ama güvenilir ve yeterli bir sonuç bulamadım. İstersen soruyu biraz daha açık yaz.", "bulunamadi"
 
 # =========================================================
 # AUTH
@@ -1275,6 +1428,13 @@ input:focus{
   color:#a8b1be;
 }
 
+/* CODE BLOCKS IN CHAT */
+.code-card{margin-top:14px;border:1px solid rgba(255,255,255,.09);border-radius:15px;overflow:hidden;background:#070a0f;box-shadow:0 14px 45px rgba(0,0,0,.25)}
+.code-card-head{display:flex;align-items:center;justify-content:space-between;padding:9px 11px;background:#0d131b;border-bottom:1px solid rgba(255,255,255,.07)}
+.code-lang{color:#7f8b9a;font-size:11px;font-weight:800;text-transform:uppercase}
+.copy-code{border:0;border-radius:8px;padding:7px 10px;background:#17212b;color:#e8edf3;font-size:11px;font-weight:800;cursor:pointer}
+.copy-code:hover{background:#20303d}
+.code-card pre{margin:0;padding:15px;overflow:auto;white-space:pre;color:#e8edf3;font:12px/1.7 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 .mobile-menu{
   display:none;
 }
@@ -1848,6 +2008,23 @@ def chat():
       if(row) row.remove();
     }
 
+    function renderAnswer(text){
+      const blocks=[];
+      const placeholder="___VANTORIUM_CODE_";
+      let i=0;
+      text=String(text||"").replace(/```([a-zA-Z0-9+#_-]*)\\n?([\\s\\S]*?)```/g,(m,lang,code)=>{
+        const key=placeholder+(i++);
+        blocks.push({key,lang:lang||"code",code:code.replace(/^\\n|\\n$/g,"")});
+        return key;
+      });
+      let out=esc(text).replace(/[*][*](.*?)[*][*]/g,"<strong>$1</strong>").replace(/\n/g,"<br>");
+      blocks.forEach(block=>{
+        const codeHtml=`<div class="code-card"><div class="code-card-head"><span class="code-lang">${esc(block.lang)}</span><button class="copy-code" type="button">Kopyala</button></div><pre>${esc(block.code)}</pre></div>`;
+        out=out.replace(block.key,codeHtml);
+      });
+      return out;
+    }
+
     async function sendChat(){
       const text=input.value.trim();
 
@@ -1860,11 +2037,17 @@ def chat():
 
       const thinking=addThinking();
 
-      const stages=[
+      const looksLikeCode=/(\bkodu\b|\bkodunu\b|\bpython\b|\bhtml\b|\bjavascript\b|\bjs\b|\bphp\b|\bcss\b|\bgithub\b|\bkod vr\b|\bkdunu\b)/i.test(text);
+      const stages=looksLikeCode ? [
+        ["Düşünüyor...","Kod isteğini analiz ediyor"],
+        ["GitHub'da kod arıyor...","Uygun açık kaynak örneklerini tarıyor"],
+        ["Kodu inceliyor...","Dosya yapısını ve uygun bölümleri kontrol ediyor"],
+        ["En uygun kodu hazırlıyor...","Gereksiz kısımları ayıklıyor"],
+        ["Cevabı hazırlıyor...","Kopyalanabilir kod bloğunu oluşturuyor"]
+      ] : [
         ["Düşünüyor...","Sorunun ne istediğini belirliyor"],
-        ["Web'de arıyor...","Google sonuçlarını tarıyor"],
-        ["Kaynakları inceliyor...","En alakalı bilgileri karşılaştırıyor"],
-        ["GitHub'da kod arıyor...","Teknik sonuçları kontrol ediyor"],
+        ["Web'de arıyor...","Uygun sonuçları tarıyor"],
+        ["Bilgileri inceliyor...","En alakalı bilgileri karşılaştırıyor"],
         ["En uygun cevabı hazırlıyor...","Gereksiz bilgileri eliyor"]
       ];
 
@@ -1893,13 +2076,22 @@ def chat():
         removeThinking();
 
         const bubble=addMessage(data.answer || "Cevap alınamadı.","ai");
-
-        // Basit markdown görünümü.
-        bubble.innerHTML=esc(data.answer || "")
-          .replace(/\\*\\*(.*?)\\*\\*/g,"<strong>$1</strong>")
-          .replace(/\\n/g,"<br>");
-
+        bubble.innerHTML=renderAnswer(data.answer || "");
         historyEl.scrollTop=historyEl.scrollHeight;
+
+        bubble.querySelectorAll(".copy-code").forEach(btn=>{
+          btn.addEventListener("click",async()=>{
+            const code=btn.closest(".code-card").querySelector("pre").textContent;
+            try{
+              await navigator.clipboard.writeText(code);
+              btn.textContent="Kopyalandı ✓";
+              setTimeout(()=>btn.textContent="Kopyala",1400);
+            }catch(e){
+              btn.textContent="Kopyalanamadı";
+              setTimeout(()=>btn.textContent="Kopyala",1400);
+            }
+          });
+        });
 
       }catch(error){
         clearInterval(timer);
@@ -2257,7 +2449,7 @@ def api_word(apikey):
                 (time.time() - start) * 1000,
                 2
             ),
-            "engine": "Vantorium v5.0",
+            "engine": "Vantorium v6.0",
             "timestamp": datetime.now().astimezone().isoformat()
         }
     })
