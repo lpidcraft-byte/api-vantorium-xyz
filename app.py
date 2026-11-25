@@ -20,7 +20,6 @@ from datetime import datetime, timedelta
 from functools import wraps
 from contextlib import contextmanager
 from collections import Counter, defaultdict, deque
-from concurrent.futures import ThreadPoolExecutor, wait
 from threading import Lock
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask import (
@@ -468,10 +467,25 @@ def safe_math(expression):
 # =========================================================
 
 def cse_search(query, search_type="web", num=6):
-    """
-    Google Programmable Search Element endpoint'ini kullanır.
-    Google API anahtarı gerekmez.
-    """
+    """Google'da arar; sonuçları {title, url, snippet, source} listesi olarak döner."""
+
+    api_key = os.environ.get("GOOGLE_API_KEY", "").strip()
+    if api_key:
+        try:
+            r = requests.get(
+                "https://www.googleapis.com/customsearch/v1",
+                params={"key": api_key, "cx": GOOGLE_CX, "q": query,
+                        "num": min(max(num, 1), 10), "hl": "tr", "safe": "active"},
+                timeout=7,
+            )
+            if r.status_code == 200:
+                return [{
+                    "title": it.get("title", ""), "url": it.get("link", ""),
+                    "snippet": re.sub(r"\s+", " ", it.get("snippet", "")).strip(), "source": "Google",
+                } for it in r.json().get("items", []) if it.get("link")]
+            print(f"[google] HTTP {r.status_code}")
+        except Exception as e:
+            print(f"[google] hata: {e}")
 
     url = "https://cse.google.com/cse/element/v1"
 
@@ -501,11 +515,13 @@ def cse_search(query, search_type="web", num=6):
         r = requests.get(url, params=params, headers=headers, timeout=7)
 
         if r.status_code != 200:
+            print(f"[google] HTTP {r.status_code}")
             return []
 
         match = re.search(r"vantoriumCallback\((.*)\)\s*;?\s*$", r.text, re.S)
 
         if not match:
+            print("[google] beklenmeyen yanıt biçimi")
             return []
 
         data = json.loads(match.group(1))
@@ -530,7 +546,8 @@ def cse_search(query, search_type="web", num=6):
 
         return results
 
-    except Exception:
+    except Exception as e:
+        print(f"[google] hata: {e}")
         return []
 
 # =========================================================
@@ -595,50 +612,6 @@ def cse_image_search(query, num=8):
         return []
 
 # =========================================================
-# WIKIPEDIA
-# =========================================================
-
-def wikipedia_search(query, num=4):
-    try:
-        url = "https://tr.wikipedia.org/w/api.php"
-
-        params = {
-            "action": "query",
-            "list": "search",
-            "srsearch": query,
-            "utf8": 1,
-            "format": "json",
-            "srlimit": num,
-        }
-
-        r = requests.get(
-            url, params=params,
-            headers={"User-Agent": "VantoriumAI/5.0"}, timeout=7
-        )
-
-        data = r.json()
-        results = []
-
-        for item in data.get("query", {}).get("search", []):
-            title = item.get("title", "")
-            snippet = re.sub(r"<[^>]+>", "", item.get("snippet", ""))
-
-            results.append({
-                "title": title,
-                "url": (
-                    "https://tr.wikipedia.org/wiki/"
-                    + urllib.parse.quote(title.replace(" ", "_"))
-                ),
-                "snippet": snippet,
-                "source": "Wikipedia",
-            })
-
-        return results
-
-    except Exception:
-        return []
-
-# =========================================================
 # GITHUB SEARCH
 # =========================================================
 
@@ -695,9 +668,6 @@ def score_result(result, query):
             score += 2
 
     source = result.get("source", "").lower()
-
-    if source == "wikipedia":
-        score += 3
 
     if source == "github":
         score += 4
@@ -1061,9 +1031,8 @@ def search_everywhere(query, parts=None):
         parts = analyze_query(query)
     search_query = make_search_query(query, parts)
     google_results = cse_search(search_query, "web", 6)
-    wiki_results = wikipedia_search(search_query, 3)
     github_results = github_search(search_query, 5) if parts.get("is_code") else []
-    results = best_results(google_results + github_results + wiki_results, search_query, 8)
+    results = best_results(google_results + github_results, search_query, 8)
     query_terms = [w for w in normalize(search_query).split() if len(w) >= 3]
     relevant = []
     for item in results:
@@ -1171,8 +1140,10 @@ def local_creative_answer(query):
 
 def local_knowledge_answer(query):
     q = normalize(query)
+    if len(q.split()) > 4:  # uzun/ayrıntılı sorularda tanım dönme
+        return None
     for key, answer in LOCAL_KNOWLEDGE.items():
-        if key in q:
+        if re.search(r"(?<!\w)" + re.escape(key) + r"(?!\w)", q):
             return answer
     return None
 
@@ -1915,7 +1886,7 @@ def search_page():
     <main class="search-page">
       <section class="search-hero">
         <h1>Vantorium Arama</h1>
-        <p>Web, Wikipedia, GitHub ve görseller üzerinde ara.</p>
+        <p>Web, GitHub ve görseller üzerinde ara.</p>
 
         <form class="search-box" onsubmit="doSearch(event)">
           <input id="searchInput" type="text" placeholder="Ne aramak istiyorsun?" autocomplete="off">
@@ -2102,9 +2073,9 @@ def info():
       <div class="card">
         <h3>Vantorium nedir?</h3>
         <p>
-          Vantorium; Wikipedia, web sayfaları ve yerel bilgi tabanından
-          araştırma yaparak uzun, kaynaklı cevaplar hazırlayan; ayrıca
-          hazır kod örnekleri sunan bir asistandır.
+          Vantorium; Google'daki ilk sonucu okuyup düzenli cevaplar
+          hazırlayan, hazır kod örnekleri sunan ve yerel bilgi tabanıyla
+          sohbet edebilen bir asistandır.
         </p>
       </div>
 
@@ -2307,11 +2278,8 @@ def _domain(url):
 
 
 # =========================================================
-# KAYNAK TOPLAMA: Google CSE + Vikipedi + sayfa okuma
+# KAYNAK: Google'daki ilk sonuç
 # =========================================================
-
-_SKIP_DOMAINS = ("youtube.com", "youtu.be", "facebook.com", "instagram.com", "twitter.com", "x.com",
-                 "tiktok.com", "pinterest.", "linkedin.com", "wikipedia.org")
 
 
 def _public_url(url):
@@ -2373,118 +2341,50 @@ def fetch_page(url):
     return page
 
 
-def wiki_article(title):
-    """Vikipedi makalesini (başlık, [(bölüm, metin)]) olarak döner."""
-    cached = _cache_get(("wiki", title))
-    if cached is not None:
-        return cached or None
-    try:
-        r = requests.get(
-            "https://tr.wikipedia.org/w/api.php",
-            params={"action": "query", "prop": "extracts", "explaintext": 1, "redirects": 1,
-                    "titles": title, "format": "json", "utf8": 1},
-            headers=UA, timeout=7,
-        )
-        page = next(iter(r.json()["query"]["pages"].values()))
-        extract = page.get("extract", "")[:70000]
-        real = page.get("title", title)
-    except Exception:
-        return None
-    if len(extract) < 300:
-        _cache_put(("wiki", title), False, 600)
-        return None
-    skip = {"kaynakça", "dış bağlantılar", "notlar", "ayrıca bakınız", "kaynaklar", "dipnotlar", "ileri okuma",
-            "bibliyografya", "harici bağlantılar"}
-    chunks = re.split(r"\n(={2,4})\s*(.+?)\s*\1\s*\n", extract)
-    sections = [("Genel bakış", chunks[0])]
-    for i in range(1, len(chunks) - 2, 3):
-        if _lower(chunks[i + 1]) not in skip and len(chunks[i + 2]) > 80:
-            sections.append((chunks[i + 1], chunks[i + 2]))
-    result = (real, sections)
-    _cache_put(("wiki", title), result)
-    return result
+# Google aramasında Vikipedi'yi doğrudan kullanmıyoruz.
+# Arama motoru Google CSE'dir; cevap yalnızca Google'ın seçtiği ilk
+# uygun web sonucunun snippet/sayfa metninden yerel kurallarla hazırlanır.
+# Harici bir yapay zekâ / LLM API'si kullanılmaz.
+
+def _google_query(query, parts):
+    if parts.get("is_definition"):
+        target = _G["extract_target"](query, parts)
+        base = f"{target} nedir"
+    else:
+        base = re.sub(r"\s+", " ", query).strip()[:200]
+
+    # Kullanıcı Google'dan sonuç istiyor; Wikipedia'yı ayrı kaynak olarak
+    # aramamak için Google sorgusundan Wikipedia alan adlarını çıkar.
+    return base + " -site:wikipedia.org -site:tr.wikipedia.org"
 
 
-def gather(query, parts, max_pages=3, timeout=7.5):
-    """Paralel arama: web sonuçları, Vikipedi makalesi ve en iyi sayfaların metni."""
-    G = _G
-    key = ("gather", G["normalize"](query), max_pages)
+def first_result(query, parts):
+    """Google'daki ilk uygun sonucu ve okunabilirse sayfa metnini döner.
+
+    Önemli: Burada sonuçlar yeniden puanlanmaz/sıralanmaz. Google CSE'nin
+    döndürdüğü ilk URL doğrudan kullanılır. Böylece cevap gerçekten
+    "Google'da ara -> ilk sonuç -> yerel cevap üret" akışından geçer.
+    """
+    key = ("first", _G["normalize"](query))
     cached = _cache_get(key)
     if cached is not None:
         return cached
 
-    sq = G["make_search_query"](query, parts)
-    topic = _clean_topic(G["extract_target"](query, parts))
-    ex = ThreadPoolExecutor(max_workers=6)
-    try:
-        f_web = ex.submit(G["cse_search"], sq, "web", 8)
-        f_wiki = ex.submit(G["wikipedia_search"], topic, 3)
-        wait([f_web, f_wiki], timeout=timeout)
-        web = f_web.result() if f_web.done() and not f_web.exception() else []
-        hits = f_wiki.result() if f_wiki.done() and not f_wiki.exception() else []
+    results = _G["cse_search"](_google_query(query, parts), "web", 10)
+    results = [r for r in results if r.get("url")]
+    if not results:
+        return None
 
-        qt = set(_tokens(topic))
-        title = None
-        for h in hits:
-            if qt & set(_tokens(h.get("title", ""))):
-                title = h["title"]
-                break
-        page_urls = [r["url"] for r in web if r.get("url") and not any(d in r["url"].lower() for d in _SKIP_DOMAINS)][:max_pages]
-
-        f_art = ex.submit(wiki_article, title) if title else None
-        f_pages = [ex.submit(fetch_page, u) for u in page_urls]
-        wait(([f_art] if f_art else []) + f_pages, timeout=6.5)
-        article = f_art.result() if f_art and f_art.done() and not f_art.exception() else None
-        pages = [f.result() for f in f_pages if f.done() and not f.exception() and f.result()]
-    finally:
-        ex.shutdown(wait=False, cancel_futures=True)
-
-    bundle = {"topic": topic, "web": web, "wiki": article, "pages": pages, "wiki_title": title}
-    if web or article:
-        _cache_put(key, bundle, 1800)
+    # Sıralama yapma: Google'ın ilk sonucu = results[0].
+    top = results[0]
+    bundle = {"top": top, "page": fetch_page(top["url"])}
+    _cache_put(key, bundle, 1800)
     return bundle
 
 
 # =========================================================
 # ÖZETLEME: puanlama + MMR
 # =========================================================
-
-def _build_corpus(bundle, sources):
-    """Cümle havuzu üretir; kaynakları ortak `sources` listesine ekler (1 tabanlı numaralama)."""
-    items = []
-
-    def add_source(title, url):
-        for i, s in enumerate(sources, 1):
-            if s["url"] == url:
-                return i
-        sources.append({"title": title, "url": url, "domain": _domain(url)})
-        return len(sources)
-
-    if bundle.get("wiki"):
-        title, sections = bundle["wiki"]
-        sid = add_source(title + " — Vikipedi", "https://tr.wikipedia.org/wiki/" + urllib.parse.quote(title.replace(" ", "_")))
-        for si, (heading, text) in enumerate(sections):
-            for pos, s in enumerate(_sentences(text)[:40]):
-                items.append({"text": s, "src": sid, "sec": heading, "sec_i": si, "pos": pos, "kind": "wiki"})
-    used = set()
-    for page in bundle.get("pages", []):
-        sid = add_source(page["title"], page["url"])
-        used.add(page["url"])
-        pos = 0
-        for p in page["paras"]:
-            for s in _sentences(p):
-                items.append({"text": s, "src": sid, "sec": "web", "sec_i": 0, "pos": pos, "kind": "web"})
-                pos += 1
-    for r in bundle.get("web", []):
-        if r.get("url") in used or not r.get("url"):
-            continue
-        sents = _sentences(_G["clean_snippet"](r.get("snippet", ""), 600), lo=30)
-        if sents:
-            sid = add_source(r.get("title") or _domain(r["url"]), r["url"])
-            for pos, s in enumerate(sents):
-                items.append({"text": s, "src": sid, "sec": "web", "sec_i": 0, "pos": pos, "kind": "web"})
-    return items[:800]
-
 
 def _rank(items, qterms):
     toks = [set(_tokens(it["text"])) for it in items]
@@ -2534,61 +2434,51 @@ def _mmr(ranked, k):
     return sel
 
 
-def _cites(items):
-    return " " + "".join(f"[{n}]" for n in sorted({it["src"] for it in items}))
+def _write_single(query, top, page, qterms, depth):
+    """İlk sonucun sayfasından başlıklı, okunabilir cevap yazar."""
+    items = []
+    if page:
+        pos = 0
+        for para in page["paras"]:
+            for sent in _sentences(para):
+                items.append({"text": sent, "src": 1, "sec": "web", "sec_i": 0, "pos": pos, "kind": "web"})
+                pos += 1
+    if len(items) < 3:  # sayfa okunamadıysa Google'ın gösterdiği özeti kullan
+        snippet = _G["clean_snippet"](top.get("snippet", ""), 700)
+        sents = _sentences(snippet, lo=25) or ([snippet] if snippet else [])
+        items = [{"text": t, "src": 1, "sec": "web", "sec_i": 0, "pos": n, "kind": "web"} for n, t in enumerate(sents)]
 
-
-def _write(items, qterms, k, level="##", intro_lead=False, local_fact=None, steps=None):
-    """Seçilen cümlelerden başlıklı markdown cevap yazar. (markdown, ilk_cümle) döner."""
+    title = re.sub(r"[\[\]]", "", top.get("title") or _domain(top["url"])).strip()
+    url = top["url"].replace(")", "%29").replace(" ", "%20")
+    out = [f"> Google'da ilk çıkan sonuç: [{title}]({url})", ""]
     if not items:
-        return None
-    ranked = [it for it in _rank(items, qterms) if it["kind"] == "wiki" or it["qs"] > 0]
-    if sum(1 for it in ranked if it["qs"] > 0) < 2 and not local_fact:
-        return None
-    chosen = _mmr(ranked, k)
-    if not chosen:
-        return None
+        out.append("Bu sayfanın metnini okuyamadım; yukarıdaki bağlantıdan doğrudan açabilirsin.")
+        return "\n".join(out) + "\n"
 
-    lead = []
-    if intro_lead:
-        lead = [it for it in items if it["kind"] == "wiki" and it["sec_i"] == 0][:2]
-    if not lead:
-        lead = sorted(chosen[:2], key=lambda x: (x["src"], x["pos"]))
-    lead_text = " ".join(it["text"] for it in lead)
-    if local_fact:
-        lead_text = local_fact + " " + (lead[0]["text"] if lead else "")
-    out = [f"{level} Kısa cevap", "", lead_text.strip() + _cites(lead), ""]
+    chosen = _mmr(_rank(items, qterms), 8 * depth)
+    lead = sorted(chosen[:2], key=lambda x: x["pos"])
+    rest = sorted((it for it in chosen if all(it is not l for l in lead)), key=lambda x: x["pos"])
+    out += ["## Kısa cevap", "", " ".join(it["text"] for it in lead), ""]
+    if rest:
+        out += ["## Ayrıntılar", ""]
+        for n in range(0, len(rest), 3):
+            out += [" ".join(it["text"] for it in rest[n:n + 3]), ""]
 
-    rest = [it for it in chosen if all(it is not l for l in lead)]
-    groups = {}
-    for it in rest:
-        key = (0, it["sec_i"], it["sec"]) if it["kind"] == "wiki" else (1, 0, "web")
-        groups.setdefault(key, []).append(it)
-    has_wiki = any(k0[0] == 0 for k0 in groups)
-    for key in sorted(groups):
-        heading = key[2] if key[0] == 0 else ("Kaynaklardan ek bilgiler" if has_wiki else "Ayrıntılar")
-        out += [f"{level} {heading}", ""]
-        grp = sorted(groups[key], key=lambda x: (x["src"], x["pos"]))
-        for i in range(0, len(grp), 3):
-            chunk = grp[i:i + 3]
-            out += [" ".join(it["text"] for it in chunk) + _cites(chunk), ""]
-
-    if steps:
-        out += [f"{level} Adım adım", ""]
-        out += [f"{i}. {s}" for i, s in enumerate(steps[0][:10], 1)]
-        out.append(f" [{steps[1]}]")
-        out.append("")
-    first = re.sub(r"\s+", " ", lead[0]["text"] if lead else chosen[0]["text"])
-    return "\n".join(out).rstrip() + "\n", first
+    qn = _G["normalize"](query)
+    if page and page["steps"] and re.search(r"\b(nasıl|adım|plan|kurulum|yapılır|kurulur)\b", qn):
+        score = lambda lst: sum(1 for t in _tokens(" ".join(lst)) if t in qterms)
+        best = max(page["steps"], key=score)
+        if score(best) > 0:
+            out += ["## Adım adım", ""] + [f"{n}. {t}" for n, t in enumerate(best[:12], 1)] + [""]
+    if depth == 1:
+        out.append("> Daha fazlası için «daha detaylı anlat» yazabilirsin.")
+    return "\n".join(out).rstrip() + "\n"
 
 
 # =========================================================
 # ARAŞTIRMA AKIŞI
 # =========================================================
 
-_CMP = re.compile(
-    r"^(.+?)\s+(?:ile|ve|vs\.?|mı|mi|mu|mü)\s+(.+?)\s+(?:arasındaki\s+)?(?:fark\w*|karşılaştır\w*|hangisi\w*)\b.*$", re.I)
-_CMP2 = re.compile(r"^(.+?)\s+vs\.?\s+(.+)$", re.I)
 _DETAIL_RE = re.compile(r"^(devam|daha (fazla|detaylı|ayrıntılı|uzun)|detaylandır|ayrıntılandır|biraz daha|genişlet|uzat)\b")
 _PRON_RE = re.compile(r"^(peki|ya |bunu|onu|bunun|onun|şunu|şunun|bunlar|bu |o )")
 
@@ -2610,76 +2500,20 @@ def _contextualize(query, history):
     return query, 1
 
 
-def _split_compare(query):
-    m = _CMP.match(query.strip()) or _CMP2.match(query.strip())
-    if not m:
-        return None
-    a, b = (_clean_topic(m.group(1)), _clean_topic(m.group(2)))
-    return (a, b) if a and b and _lower(a) != _lower(b) else None
-
-
 def research_events(query, parts, depth=1):
     """Durum olayları üretir; sonunda ("result", {"md":..., "sources":[...]} | None)."""
-    G = _G
-    cmp_pair = _split_compare(query)
-    yield "status", {"text": "Web'de ve Vikipedi'de araştırıyor…"}
-
-    if cmp_pair:
-        with ThreadPoolExecutor(max_workers=2) as ex:
-            futs = [ex.submit(gather, e, G["analyze_query"](e), 2) for e in cmp_pair]
-            bundles = [f.result() for f in futs]
-        yield "status", {"text": "Kaynakları okuyor…"}
-        sources, blocks = [], []
-        for ent, b in zip(cmp_pair, bundles):
-            items = _build_corpus(b, sources)
-            res = _write(items, set(_tokens(ent)), 5 * depth + 1, level="###", intro_lead=True)
-            blocks.append((ent, res))
-        if not all(r for _, r in blocks):
-            yield "result", None
-            return
-        cell = lambda s: re.sub(r"\s+", " ", s).replace("|", "/")[:230]
-        md = ["## Karşılaştırma", "", f"| | {cmp_pair[0]} | {cmp_pair[1]} |", "|---|---|---|",
-              f"| Kısa tanım | {cell(blocks[0][1][1])} | {cell(blocks[1][1][1])} |", ""]
-        for ent, res in blocks:
-            md += [f"## {ent}", "", res[0]]
-        yield "result", {"md": "\n".join(md), "sources": sources}
-        return
-
-    bundle = gather(query, parts)
-    yield "status", {"text": "Kaynakları okuyor…"}
-    sources = []
-    items = _build_corpus(bundle, sources)
-    if not items:
+    yield "status", {"text": "Google'da arıyor…"}
+    bundle = first_result(query, parts)
+    if not bundle:
         yield "result", None
         return
-    yield "status", {"text": "Cevabı derliyor…"}
-
-    topic = bundle["topic"]
-    qn = G["normalize"](query)
-    qterms = set(_tokens(topic))
-    definition = bool(parts.get("is_definition") or re.search(r"\b(nedir|kimdir|ne demek|hakkında|anlat|açıkla)\b", qn)
-                      or len(topic.split()) <= 3)
-    steps = None
-    if "nasıl" in qn and "çalışır" not in qn:
-        best = None
-        for p in bundle["pages"]:
-            for lst in p["steps"]:
-                ov = sum(1 for t in _tokens(" ".join(lst)) if t in qterms)
-                if best is None or ov > best[0]:
-                    best = (ov, lst, p["url"])
-        if best and best[0] > 0:
-            sid = next((i for i, s in enumerate(sources, 1) if s["url"] == best[2]), 1)
-            steps = (best[1], sid)
-    local_fact = G["local_knowledge_answer"](query) if definition else None
-    res = _write(items, qterms, 9 * depth + 1, intro_lead=definition and bool(bundle["wiki"]),
-                 local_fact=local_fact, steps=steps)
-    if not res:
-        yield "result", None
-        return
-    md = res[0]
-    if depth == 1:
-        md += "\n> Daha fazlası için «daha detaylı anlat» yazabilirsin.\n"
-    yield "result", {"md": md, "sources": sources}
+    yield "status", {"text": "İlk sonucu okuyor…"}
+    top = bundle["top"]
+    md = _write_single(query, top, bundle["page"], set(_tokens(_clean_topic(query))), depth)
+    yield "result", {
+        "md": md,
+        "sources": [{"title": top.get("title") or _domain(top["url"]), "url": top["url"], "domain": _domain(top["url"])}],
+    }
 
 
 # =========================================================
@@ -3359,7 +3193,7 @@ def answer_events(query, history, uid=None):
         yield from _stream_text(local[0], local[1])
         return
 
-    # 4) Araştırma: Vikipedi + web sayfaları → uzun, kaynaklı cevap
+    # 4) Araştırma: Google ilk sonucu → yerel, kaynaklı cevap
     topic_query, depth = _contextualize(query, history)
     topic_parts = G["analyze_query"](topic_query)
     result = None
@@ -3457,7 +3291,7 @@ def _js(value):
 def chat_view():
     user = _G["get_current_user"]()
     mode = {"ai": True, "label": "Vantorium motoru",
-            "hint": "Cevaplar Vikipedi, web sayfaları ve yerel bilgi tabanından derleniyor."}
+            "hint": "Google'daki ilk sonuç okunur; cevap yerel olarak hazırlanır."}
     page = CHAT_HTML.replace("__USER_JSON__", _js(user["username"])).replace("__MODE_JSON__", _js(mode))
     return _G["render_page"]("Sohbet", page, user, show_nav=False)
 
