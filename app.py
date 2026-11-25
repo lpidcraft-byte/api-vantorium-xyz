@@ -1147,18 +1147,66 @@ def local_knowledge_answer(query):
             return answer
     return None
 
-def local_fallback_answer(query):
-    q = (query or "").strip()
-    if len(q.split()) <= 2:
+def universal_fallback_answer(query):
+    """Harici LLM kullanmadan hiçbir soruyu boş bırakmayan son cevap katmanı.
+
+    Bu katman kesin olmayan bilgiyi gerçekmiş gibi uydurmaz; sorunun türünü
+    algılayıp eldeki yerel bilgi, bağlam ve genel problem çözme kurallarıyla
+    işe yarar bir başlangıç cevabı üretir.
+    """
+    q = re.sub(r"\s+", " ", (query or "").strip())
+    if not q:
+        return "Hazırım. Ne hakkında konuşmak veya ne yapmak istiyorsun?"
+
+    nq = normalize(q)
+    words = [w for w in re.findall(r"[a-zçğıöşü0-9]+", nq) if len(w) >= 3]
+    topic = " ".join(words[:8]) or q
+
+    if re.search(r"\b(nasıl|yapılır|yapabilirim|kurulur|oluşturulur|başlayayım)\b", nq):
         return (
-            f"“{q}” hakkında hangi yönden bilgi istediğini biraz açar mısın? "
-            "Anlamını, kullanımını, örneklerini veya nasıl yapılacağını açıklayabilirim."
+            f"**{q}** için uygulanabilir bir yol şu şekilde:\n\n"
+            "1. Önce hedefi ve gerekli girdileri belirle.\n"
+            "2. İşi küçük adımlara böl ve en basit çalışan sürümü oluştur.\n"
+            "3. Çalışan kısmı test et; hata varsa hatayı oluşturan adımı ayır.\n"
+            "4. Sonucu iyileştir ve gerekiyorsa otomatikleştir.\n\n"
+            f"Bu soruda ana konu **{topic}**. Google sonucu mevcut değilse bile bu yöntemle adım adım ilerleyebiliriz."
         )
+
+    if re.search(r"\b(nedir|ne demek|anlamı|kimdir|hakkında|bilgi)\b", nq):
+        return (
+            f"**{q}** için şu anda güvenilir bir Google sonucu alınamadı. Yine de soruyu boş bırakmıyorum: "
+            f"soru **{topic}** konusunu soruyor.\n\n"
+            "Bir kavramı açıklarken temel anlamı, ne işe yaradığı, nerede kullanıldığı ve kısa bir örnek "
+            "üzerinden ilerlemek en doğru yaklaşımdır. Elimde doğrulanmış kaynak metni olmadığından burada "
+            "uydurma bir tanım vermek yerine kesinliği düşük bilgiyi açıkça ayırıyorum."
+        )
+
+    if re.search(r"\b(neden|sebebi|sebep|niye)\b", nq):
+        return (
+            f"**{q}** sorusunda kesin nedeni söylemek için kaynak veya ek bağlam gerekir. Genel olarak bir neden-sonuç "
+            "sorusunu değerlendirirken olayın zamanı, koşulları ve doğrudan etkileri birlikte incelenir. "
+            "Google sonucu gelirse Vantorium ilk sonucu okuyup cevabı onun üzerinden genişletebilir."
+        )
+
+    if re.search(r"\b(farkı|karşılaştır|hangisi|hangisi daha|mı yoksa)\b", nq):
+        return (
+            f"**{q}** için karşılaştırmayı şu ölçütlerle yapmak en sağlıklısıdır: amaç, kullanım kolaylığı, performans, "
+            "maliyet, güvenlik ve ihtiyaçlara uygunluk. Google'dan kaynak geldiğinde bu ölçütleri ilk sonuçtaki "
+            "bilgilerle doldurup net bir karşılaştırma çıkarabilirim."
+        )
+
     return (
-        "Bu soruya özel doğrulanmış bilgi bulamadım. "
-        "Arama sonuçları da yeterince ilgili değil; yanlış bilgi uydurmak istemem. "
-        "Soruyu biraz daha ayrıntılandırırsan tekrar araştırabilirim."
+        f"**{q}** hakkında bir cevap oluşturuyorum.\n\n"
+        f"Sorunun ana konusu: **{topic}**. Bu isteği boş veya sadece 'bulunamadı' şeklinde bırakmıyorum. "
+        "Vantorium önce yerel bilgi ve hafızayı, ardından Google'ın ilk sonucunu kullanır. Google erişimi başarısız "
+        "olduğunda ise harici bir yapay zekâ çağırmadan yerel cevap motoru devreye girer.\n\n"
+        "Not: Kaynak metni olmadan kesin bir olguyu uydurmamak için doğrulanmamış ayrıntıları gerçekmiş gibi "
+        "sunmuyorum. Yeni bir kaynak geldiğinde cevap otomatik olarak daha ayrıntılı hâle getirilebilir."
     )
+
+def local_fallback_answer(query):
+    # Artık "cevap bulunamadı" deyip kullanıcıyı geri çevirmiyoruz.
+    return universal_fallback_answer(query)
 
 
 def recommendation_answer(query):
@@ -2370,8 +2418,18 @@ def first_result(query, parts):
     if cached is not None:
         return cached
 
-    results = _G["cse_search"](_google_query(query, parts), "web", 10)
+    google_query = _google_query(query, parts)
+    results = _G["cse_search"](google_query, "web", 10)
     results = [r for r in results if r.get("url")]
+
+    # İlk istek başarısızsa Google'a daha sade bir ikinci sorgu gönder.
+    # Yine sıralama yapmıyoruz; dönen listenin ilk sonucu kullanılıyor.
+    if not results:
+        simple = re.sub(r"\s+", " ", _G["extract_target"](query, parts)).strip()[:160]
+        if simple and simple != google_query:
+            results = _G["cse_search"](simple + " -site:wikipedia.org -site:tr.wikipedia.org", "web", 10)
+            results = [r for r in results if r.get("url")]
+
     if not results:
         return None
 
@@ -3211,8 +3269,13 @@ def answer_events(query, history, uid=None):
         yield from _stream_text(result["md"], "arastirma")
         return
 
-    # 5) Hiçbir şey bulunamadıysa eski yerel motor
+    # 5) Google'a ulaşılamasa bile cevap akışını boş bırakma.
+    # get_answer önce yerel bilgi/hafıza yollarını dener; son aşamada
+    # universal_fallback_answer her zaman metin üretir. Harici LLM yoktur.
     answer, source = G["get_answer"](topic_query)
+    if not answer or not str(answer).strip():
+        answer = universal_fallback_answer(topic_query)
+        source = "yerel_fallback"
     yield from _stream_text(answer, source)
 
 
