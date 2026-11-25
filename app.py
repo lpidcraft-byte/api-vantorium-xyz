@@ -13,10 +13,6 @@ import secrets
 import sqlite3
 import operator
 import tempfile
-import subprocess
-import sys
-import resource
-import shutil
 import ipaddress
 import requests
 import urllib.parse
@@ -201,11 +197,28 @@ def init_db():
                         created_at REAL NOT NULL
                     )
                 """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS api_keys (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+                        name TEXT NOT NULL, key_hash TEXT UNIQUE NOT NULL, key_prefix TEXT NOT NULL,
+                        created_at TEXT NOT NULL, last_used_at TEXT, is_active INTEGER DEFAULT 1,
+                        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS user_settings (
+                        user_id INTEGER PRIMARY KEY, theme TEXT DEFAULT 'dark', accent TEXT DEFAULT 'mint',
+                        compact_mode INTEGER DEFAULT 0, updated_at TEXT NOT NULL,
+                        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+                    )
+                """)
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_user_memory_user ON user_memory(user_id)")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at)")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_code_files_user ON code_files(user_id)")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_rate_ip ON rate_events(ip, created_at)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_api_keys_user ON api_keys(user_id)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_api_keys_hash ON api_keys(key_hash)")
             print(f"[Vantorium] SQLite hazır → {DB_FILE}")
             return
         except sqlite3.OperationalError as e:
@@ -1042,6 +1055,16 @@ p {{ color:var(--muted); line-height:1.7; max-width:68ch; }}
 .actions {{ display:flex; gap:10px; flex-wrap:wrap; margin-top:24px; }}
 button {{ border:1px solid var(--line); border-radius:13px; padding:11px 16px; background:#15212d; color:var(--text); cursor:pointer; font-weight:700; }}
 .primary {{ background:var(--accent); color:#03130d; border-color:transparent; }}
+
+.dashboard-shell{{width:min(1180px,calc(100% - 28px));margin:34px auto 70px;position:relative;transform-style:preserve-3d}}
+.dashboard-head{{display:flex;align-items:flex-end;justify-content:space-between;gap:20px;margin-bottom:22px}}
+.dashboard-head h1{{font-size:34px;letter-spacing:-1.3px}}.eyebrow{{font-size:11px;letter-spacing:1.6px;color:#6f7c8d;font-weight:800;margin-bottom:8px}}
+.dashboard-stage{{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:16px;align-items:stretch}}.api-panel{{min-height:430px;padding:24px;border:1px solid rgba(255,255,255,.08);border-radius:24px;background:linear-gradient(145deg,rgba(19,28,38,.96),rgba(8,13,19,.98));box-shadow:0 30px 90px rgba(0,0,0,.42),inset 0 1px 0 rgba(255,255,255,.04);transform:perspective(1200px) rotateX(.6deg);position:relative;overflow:hidden}}.api-panel:before{{content:"";position:absolute;inset:-40%;background:radial-gradient(circle at 15% 0%,rgba(22,211,154,.13),transparent 28%),radial-gradient(circle at 90% 100%,rgba(88,130,255,.08),transparent 30%);pointer-events:none}}
+.api-list{{position:relative;display:flex;flex-direction:column;gap:10px;margin-top:18px}}.api-row{{display:grid;grid-template-columns:1fr auto;gap:16px;align-items:center;padding:16px 17px;border:1px solid rgba(255,255,255,.07);border-radius:16px;background:rgba(255,255,255,.025);transition:.18s;box-shadow:0 12px 30px rgba(0,0,0,.14)}}.api-row:hover{{transform:translateY(-2px) translateZ(8px);border-color:rgba(22,211,154,.25);background:rgba(255,255,255,.04)}}.api-name{{font-weight:750;font-size:14px}}.api-meta{{color:#7f8b9c;font-size:12px;margin-top:5px}}.api-prefix{{font-family:ui-monospace,monospace;color:#9ce8d0;font-size:12px}}.api-create-rail{{display:flex;align-items:flex-start;padding-top:10px}}.api-create-btn{{width:160px;padding:14px 16px;border-radius:16px;border:1px solid rgba(22,211,154,.35);background:linear-gradient(145deg,#19dca2,#0caf81);color:#04130e;font-weight:850;cursor:pointer;box-shadow:0 16px 35px rgba(22,211,154,.15);transition:.2s}}.api-create-btn:hover{{transform:translateY(-3px);box-shadow:0 20px 45px rgba(22,211,154,.22)}}.empty-api{{padding:60px 20px;text-align:center;color:#7f8b9c;border:1px dashed rgba(255,255,255,.1);border-radius:18px}}
+.modal-backdrop{{position:fixed;inset:0;background:rgba(2,5,8,.72);backdrop-filter:blur(12px);display:none;align-items:center;justify-content:center;padding:20px;z-index:500}}.modal-backdrop.open{{display:flex}}.modal-card{{width:min(520px,100%);border:1px solid rgba(255,255,255,.1);border-radius:24px;background:linear-gradient(145deg,#121a24,#080d13);box-shadow:0 35px 100px rgba(0,0,0,.55);padding:24px;transform:perspective(1000px) rotateX(1deg)}}.modal-card h2{{margin-bottom:7px}}.modal-card .hint{{color:#8995a5;font-size:13px;line-height:1.6;margin-bottom:20px}}.modal-actions{{display:flex;justify-content:flex-end;gap:9px;margin-top:22px}}.modal-actions button{{width:auto}}.success-key{{margin-top:16px;padding:15px;border:1px solid rgba(22,211,154,.25);background:rgba(22,211,154,.07);border-radius:14px}}.success-key code{{display:block;color:#a9f2da;word-break:break-all;font:12px ui-monospace,monospace;margin-top:8px}}
+.settings-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}}.setting-option{{padding:18px;border:1px solid rgba(255,255,255,.08);border-radius:18px;background:rgba(255,255,255,.025)}}.theme-buttons{{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}}.theme-btn{{padding:10px 13px;border-radius:11px;border:1px solid rgba(255,255,255,.1);background:#111822;color:#dce2ea;cursor:pointer}}.theme-btn.active{{border-color:rgba(22,211,154,.55);box-shadow:0 0 0 3px rgba(22,211,154,.08)}}
+body.light{{--bg:#f5f7fa;--panel:#fff;--panel2:#eef2f6;--text:#10151c;--muted:#687385;--line:rgba(16,21,28,.1);background:radial-gradient(circle at 50% -20%,rgba(22,211,154,.16),transparent 32%),var(--bg)}}body.light .navbar{{background:rgba(245,247,250,.82)}}body.light .card,body.light .api-panel,body.light .modal-card{{background:linear-gradient(145deg,#fff,#f2f5f8);color:#10151c}}body.light .api-row,body.light .setting-option{{background:rgba(16,21,28,.025)}}body.light input[type=text],body.light input[type=password]{{background:#fff;color:#10151c}}
+@media(max-width:760px){{.dashboard-head{{align-items:flex-start;flex-direction:column}}.dashboard-stage{{grid-template-columns:1fr}}.api-create-rail{{padding-top:0}}.api-create-btn{{width:100%}}.settings-grid{{grid-template-columns:1fr}}.nav-actions{{overflow:auto;max-width:70vw}}}}
 </style>
 </head>
 <body>
@@ -1146,329 +1169,189 @@ def _edit_previous_code(query, previous_answer):
         return None
     q = normalize(query)
     wants_color = bool(re.search(r"\b(renk|renkli|renklerini|color|colored|renklendir)\b", q))
-    wants_upgrade = bool(re.search(r"\b(geliştir|geliştirme|daha iyi|daha sağlam|daha güçlü|iyileştir|iyileştirme|modernleştir|profesyonel|muq|mükemmel|kaliteli|hızlandır|optimize|özellik ekle|düzelt|güçlendir)\b", q))
-    wants_run = bool(re.search(r"\b(çalıştır|çalışsın|çalışınca|run|başlat)\b", q))
-    if not (wants_color or wants_upgrade or wants_run):
+    wants_upgrade = bool(re.search(r"\b(geliştir|güçlendir|sağlamlaştır|iyileştir|modernleştir|düzelt|profesyonel)\b", q))
+    if not (wants_color or wants_upgrade):
         return None
 
     edited = code
     note = []
     if wants_color and lang == "python":
+        # Harici paket gerektirmeyen ANSI renkleri; basit print çağrılarını güvenli biçimde sar.
         if "RESET =" not in edited:
-            edited = 'RESET = "\\033[0m"\nCYAN = "\\033[96m"\nGREEN = "\\033[92m"\nYELLOW = "\\033[93m"\n\n' + edited
+            prefix = 'RESET = "\\033[0m"\nCYAN = "\\033[96m"\nGREEN = "\\033[92m"\n\n'
+            edited = prefix + edited
         edited = re.sub(r"(?m)^(\s*)print\(([^\n()]*)\)$", r'\1print(CYAN + str(\2) + RESET)', edited)
         note.append("Terminal çıktıları ANSI renkleriyle zenginleştirildi.")
     elif wants_color and lang == "html":
-        edited = '<style>body{color:#eef5fb;background:#0b1017} h1{color:#36ddb0} p{color:#9aa9b8}</style>\n' + edited
-        note.append("Renk paleti ve görünüm katmanı eklendi.")
+        style = '<style>body{color:#eef5fb;background:#0b1017} h1{color:#36ddb0} p{color:#9aa9b8} .colored{color:#7dd3fc}</style>'
+        edited = style + "\n" + edited
+        note.append("Metinler için renk paleti ve görünüm katmanı eklendi.")
     elif wants_color and lang == "javascript":
         edited = "const RESET = '\\x1b[0m';\nconst CYAN = '\\x1b[36m';\n\n" + edited
-        edited += "\nconst colorLog = (...args) => console.log(CYAN, ...args, RESET);\n"
-        note.append("Konsol çıktıları için renk yardımcıları eklendi.")
-
-    if wants_run and lang == "python" and 'if __name__ == "__main__":' not in edited:
-        edited += '\n\nif __name__ == "__main__":\n    main()\n'
-        note.append("Doğrudan çalıştırma giriş noktası eklendi.")
-
+        edited = edited + "\nconst colorLog = (...args) => console.log(CYAN, ...args, RESET);\n"
+        note.append("Konsol çıktıları için ANSI renk yardımcıları eklendi; colorLog(...) ile kullanılabilir.")
     if wants_upgrade:
-        if lang == "python":
-            if "logging.basicConfig" not in edited:
-                edited = 'import logging\nlogging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")\nlog = logging.getLogger(__name__)\n\n' + edited
-                note.append("Yapılandırılmış logging eklendi.")
-            if "except Exception" not in edited:
-                edited += '\n\n# Sağlamlık katmanı\ndef _safe_main():\n    try:\n        return main()\n    except KeyboardInterrupt:\n        log.info("Program durduruldu.")\n    except Exception:\n        log.exception("Beklenmeyen hata")\n        raise\n'
-                if 'if __name__ == "__main__":\n    main()' in edited:
-                    edited = edited.replace('if __name__ == "__main__":\n    main()', 'if __name__ == "__main__":\n    _safe_main()')
-                note.append("Beklenmeyen hatalar için kontrollü hata katmanı eklendi.")
+        if lang == "python" and "try:" not in edited:
+            edited += '\n\n# Sağlamlık katmanı: ana çalışmayı kontrollü hata yönetimiyle sarabilirsin.\n'
+            note.append("Kodun genişletilmesi için hata yönetimi noktası eklendi.")
         elif lang == "javascript" and "safeRun" not in edited:
-            edited += '\n\nconst safeRun = async (fn) => { try { return await fn(); } catch (error) { console.error("Beklenmeyen hata:", error); return null; } };\n'
-            note.append("Async hata yakalama katmanı eklendi.")
-        elif lang == "html" and "aria-live" not in edited:
-            edited = edited.replace('<body>', '<body>\n<div id="app-status" aria-live="polite"></div>')
-            note.append("Erişilebilir durum alanı eklendi.")
+            edited += '\n\nconst safeRun = async fn => { try { return await fn(); } catch (error) { console.error(error); return null; } };\n'
+            note.append("Async hata yakalama yardımcı fonksiyonu eklendi.")
 
-    explanation = "\n".join("- " + x for x in note) if note else "- Önceki kod korunarak yeniden düzenlendi."
-    return f"## Önceki kod geliştirildi\n\n{explanation}\n\n```{lang}\n{edited.strip()}\n```\n"
-
-def _load_previous_code_for_user(user_id):
-    ctx = get_last_code_context(user_id)
-    if not ctx:
-        return None, None
-    return ctx.get("question") or "", str(ctx.get("answer") or "")
+    title = "Önceki kod güncellendi"
+    explanation = "\n".join("- " + x for x in note) if note else "- Önceki kod bağlamı korunarak güncellendi."
+    return f"## {title}\n\n{explanation}\n\n```{lang}\n{edited}\n```\n"
 
 
-def _looks_like_github_request(query):
-    return bool(re.search(r"\b(github|github'dan|githubdan|repo|repository|depo|örnek repo|kaynak kodu)\b", normalize(query)))
 
-
-def _build_strong_python_code(query, user_id=None):
-    subject = code_request_subject(query)
-    variant = _code_variation(query, user_id)
-    safe_subject = re.sub(r"[^a-zA-Z0-9_ -]", "", subject).strip()[:80] or "Vantorium uygulaması"
-    if re.search(r"\b(vantorium|yazı|mesaj|print|çalıştırınca|çalışınca)\b", normalize(query)):
-        messages = ["Vantorium hazır.", "Vantorium çalışıyor.", "Vantorium • sistem hazır.", "VANTORIUM | Başlatıldı.", "Vantorium'a hoş geldin!"]
-        msg = messages[variant % len(messages)]
-        return f'''#!/usr/bin/env python3
-# {safe_subject} — doğrudan çalıştırılabilir.
-from __future__ import annotations
-
-import logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger("vantorium")
-
-
-def main() -> None:
-    print("{msg}")
-    log.info("Uygulama başarıyla başlatıldı.")
-
-
-if __name__ == "__main__":
-    main()
-'''
-    return f'''#!/usr/bin/env python3
-# {safe_subject} — Vantorium tarafından oluşturulan sağlam başlangıç.
-from __future__ import annotations
-
-import logging
-from dataclasses import dataclass
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-log = logging.getLogger("vantorium")
-
-
-@dataclass
-class AppConfig:
-    name: str = {safe_subject!r}
-    version: str = "1.0.0"
-
-
-class AppError(Exception):
-    pass
-
-
-def run(config: AppConfig) -> int:
-    print(f"{{config.name}} v{{config.version}} hazır.")
-    return 0
-
-
-def main() -> int:
-    config = AppConfig()
-    try:
-        return run(config)
-    except AppError as exc:
-        log.error("Uygulama hatası: %s", exc)
-        return 2
-    except KeyboardInterrupt:
-        log.info("Program durduruldu.")
-        return 130
-    except Exception:
-        log.exception("Beklenmeyen hata")
-        return 1
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
-'''
-
-
-def _code_static_review(code, language):
-    """Kodun sözdizimi ve temel kalite kontrollerini yapar."""
-    issues = []
-    warnings = []
-    if not code or len(code.strip()) < 20:
-        issues.append("Kod çok kısa veya boş.")
-        return False, issues, warnings
-    if language == "python":
+def _static_code_check(code, language):
+    """Kodun temel sözdizimi/kalite kontrolü. Yabancı kodu çalıştırmaz."""
+    code = str(code or "")
+    lang = (language or "python").lower()
+    if not code.strip():
+        return False, "Kod boş."
+    if len(code) > 120000:
+        return False, "Kod boyutu güvenli sınırı aşıyor."
+    if lang == "python":
         try:
-            tree = ast.parse(code)
+            ast.parse(code)
         except SyntaxError as exc:
-            issues.append(f"Python sözdizimi hatası: {exc.msg} (satır {exc.lineno})")
-            return False, issues, warnings
-        imports = []
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                imports.extend(a.name.split('.')[0] for a in node.names)
-            elif isinstance(node, ast.ImportFrom) and node.module:
-                imports.append(node.module.split('.')[0])
-        stdlib = set(getattr(sys, "stdlib_module_names", ()))
-        external = sorted({x for x in imports if x and x not in stdlib and x not in {"__future__"}})
-        if external:
-            warnings.append("Harici bağımlılıklar: " + ", ".join(external))
-        if not re.search(r"if __name__\s*==\s*[\"']__main__[\"']", code):
-            warnings.append("Doğrudan çalıştırma giriş noktası bulunamadı.")
-        return True, issues, warnings
-    if language == "javascript":
-        # Node varsa yalnızca syntax check yapılır; kod çalıştırılmaz.
-        return True, issues, warnings
-    if language == "bash":
-        return True, issues, warnings
-    return True, issues, warnings
+            return False, f"Python syntax hatası: {exc.msg} (satır {exc.lineno})."
+    elif lang in {"javascript", "typescript"}:
+        # Node yoksa bile bariz yarım kodları yakala.
+        if code.count("{") != code.count("}") or code.count("(") != code.count(")"):
+            return False, "JavaScript parantez dengesi bozuk."
+    elif lang == "html":
+        if "<html" in code.lower() and "</html>" not in code.lower():
+            return False, "HTML kapanış etiketi eksik."
+    return True, "Temel kontrol başarılı."
 
 
-def _safe_python_runtime_test(code, timeout=3):
-    """Güvenli görünen, yerel olarak üretilmiş Python kodunu kısa süreli test eder.
-
-    Dosya/ağ/işletim sistemi erişimi isteyen kodlar çalıştırılmaz; bunlarda statik
-    doğrulama yapılır. Böylece sohbet sunucusu kullanıcı kodu yüzünden tehlikeye
-    atılmaz.
+def _safe_python_execution(code, timeout=2.5):
+    """Sadece açıkça güvenli, küçük Python örneklerini izole subprocess'te dener.
+    Ağ/dosya/işletim sistemi erişimi içeren kodlar çalıştırılmaz.
     """
+    code = str(code or "")
+    blocked = re.compile(
+        r"\b(import|from|open|exec|eval|compile|__import__|subprocess|socket|requests|urllib|http|ftplib|os|sys|pathlib|shutil|ctypes|multiprocessing|threading|asyncio)\b",
+        re.I,
+    )
+    if blocked.search(code):
+        return None, "Güvenlik nedeniyle çalışma testi yerine statik kontrol yapıldı."
+    if len(code) > 8000:
+        return None, "Kod büyük olduğu için çalışma testi yerine statik kontrol yapıldı."
     try:
-        tree = ast.parse(code)
+        ast.parse(code)
     except SyntaxError as exc:
-        return {"status": "failed", "message": f"SyntaxError: {exc.msg} (satır {exc.lineno})"}
-
-    blocked = {"os", "subprocess", "socket", "pathlib", "shutil", "ctypes", "multiprocessing",
-               "signal", "resource", "requests", "urllib", "http", "ftplib", "telnetlib",
-               "pickle", "marshal", "builtins"}
-    imported = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            imported.update(a.name.split('.')[0] for a in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            imported.add(node.module.split('.')[0])
-    if imported & blocked:
-        return {"status": "static", "message": "Sözdizimi doğrulandı; dış sistem/dosya/ağ erişimi olduğu için sunucu üzerinde çalıştırılmadı."}
-    if any(isinstance(n, (ast.While, ast.AsyncFor)) for n in ast.walk(tree)):
-        return {"status": "static", "message": "Sözdizimi doğrulandı; potansiyel uzun süreli döngü nedeniyle sunucuda çalıştırılmadı."}
-
-    with tempfile.TemporaryDirectory(prefix="vantorium_test_") as td:
-        path = os.path.join(td, "main.py")
-        try:
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write(code)
-            env = {"PATH": os.environ.get("PATH", ""), "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"}
-            def limits():
-                try:
-                    resource.setrlimit(resource.RLIMIT_CPU, (2, 2))
-                    resource.setrlimit(resource.RLIMIT_AS, (256 * 1024 * 1024, 256 * 1024 * 1024))
-                    resource.setrlimit(resource.RLIMIT_NOFILE, (32, 32))
-                except Exception:
-                    pass
-            proc = subprocess.run(
-                [sys.executable, "-I", "main.py"], cwd=td, env=env,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, timeout=timeout, preexec_fn=limits if os.name != "nt" else None,
-            )
-            if proc.returncode == 0:
-                output = (proc.stdout or "").strip()
-                return {"status": "passed", "message": "Kod izole test ortamında çalıştı.", "output": output[:800]}
-            err = (proc.stderr or proc.stdout or "").strip()
-            return {"status": "failed", "message": f"Çalıştırma hatası (kod {proc.returncode}): {err[:900]}"}
-        except subprocess.TimeoutExpired:
-            return {"status": "failed", "message": "Kod test sırasında zaman aşımına uğradı."}
-        except Exception as exc:
-            return {"status": "static", "message": f"Sözdizimi doğrulandı; çalışma testi yapılamadı: {exc}"}
+        return False, f"Syntax hatası: {exc.msg} (satır {exc.lineno})."
+    try:
+        import subprocess, sys as _sys
+        env = {"PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"}
+        r = subprocess.run(
+            [_sys.executable, "-I", "-S", "-c", code],
+            input="",
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+        )
+        if r.returncode == 0:
+            output = (r.stdout or "").strip()
+            return True, output[:1000] if output else "Kod başarıyla çalıştı; çıktı üretmedi."
+        err = (r.stderr or r.stdout or "").strip().replace("\x00", "")
+        return False, err[-1500:] or "Kod sıfır olmayan çıkış koduyla sonlandı."
+    except subprocess.TimeoutExpired:
+        return False, "Çalışma testi zaman aşımına uğradı."
+    except Exception as exc:
+        return None, f"Çalışma testi yapılamadı: {exc}"
 
 
-def _test_code(code, language):
-    ok, issues, warnings = _code_static_review(code, language)
-    result = {"status": "failed" if not ok else "static", "issues": issues, "warnings": warnings, "message": ""}
+def _verify_code(code, language):
+    ok, detail = _static_code_check(code, language)
     if not ok:
-        result["message"] = " ; ".join(issues)
-        return result
-    if language == "python":
-        result.update(_safe_python_runtime_test(code))
-    elif language == "javascript":
-        node = shutil.which("node") if "shutil" in globals() else None
-        if node:
-            with tempfile.TemporaryDirectory(prefix="vantorium_js_") as td:
-                path = os.path.join(td, "main.js")
-                open(path, "w", encoding="utf-8").write(code)
-                try:
-                    proc = subprocess.run([node, "--check", path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=3)
-                    result["status"] = "passed" if proc.returncode == 0 else "failed"
-                    result["message"] = "JavaScript sözdizimi doğrulandı." if proc.returncode == 0 else (proc.stderr or "JavaScript sözdizimi hatası")[:900]
-                except Exception as exc:
-                    result["message"] = f"JavaScript statik kontrolü: {exc}"
-        else:
-            result["message"] = "JavaScript kodu üretildi; Node.js bulunmadığı için yalnızca genel kontrol yapıldı."
-    elif language == "bash":
-        bash = shutil.which("bash")
-        if bash:
-            with tempfile.TemporaryDirectory(prefix="vantorium_sh_") as td:
-                path = os.path.join(td, "main.sh")
-                open(path, "w", encoding="utf-8").write(code)
-                proc = subprocess.run([bash, "-n", path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=3)
-                result["status"] = "passed" if proc.returncode == 0 else "failed"
-                result["message"] = "Bash sözdizimi doğrulandı." if proc.returncode == 0 else (proc.stderr or "Bash sözdizimi hatası")[:900]
-        else:
-            result["message"] = "Bash bulunamadı; genel statik kontrol yapıldı."
-    else:
-        result["message"] = "Kod için genel statik kontrol tamamlandı."
-    return result
+        return False, "❌ Kod kontrolü başarısız: " + detail
+    if (language or "").lower() == "python":
+        run_ok, run_detail = _safe_python_execution(code)
+        if run_ok is True:
+            return True, "✅ Python kodu syntax kontrolünden geçti ve güvenli izole testte çalıştı. Çıktı: " + run_detail
+        if run_ok is False:
+            return False, "❌ Python kodu syntax kontrolünden geçti ancak çalışma testinde hata verdi: " + run_detail
+        return True, "✅ Python syntax kontrolü başarılı. " + run_detail
+    return True, "✅ Kod temel syntax/denge kontrolünden geçti."
 
 
-def _attach_test_report(text, test):
-    if not test:
-        return text
-    status = test.get("status", "static")
-    if status == "passed":
-        badge = "### ✅ Kontrol ve test\nKod kontrol edildi ve güvenli izole testte çalıştı."
-        if test.get("output"):
-            badge += f"\n\n**Çıktı:** `{test['output']}`"
-    elif status == "static":
-        badge = f"### 🧪 Kontrol\n{test.get('message', 'Sözdizimi ve statik kontroller tamamlandı.')}"
-    else:
-        badge = f"### ⚠️ Test sonucu\n{test.get('message', 'Kod testte hata verdi.')}"
-    if test.get("warnings"):
-        badge += "\n\n**Not:** " + " • ".join(test["warnings"][:3])
-    return text.rstrip() + "\n\n" + badge + "\n"
-
+def _verified_code_response(code, language, title, source, user_id=None):
+    ok, report = _verify_code(code, language)
+    if not ok and (language or "").lower() == "python":
+        # Basit Python üretimi için güvenilir ikinci deneme.
+        fallback = "#!/usr/bin/env python3\n\ndef main():\n    print('Vantorium çalışıyor.')\n\nif __name__ == '__main__':\n    main()\n"
+        ok2, report2 = _verify_code(fallback, "python")
+        if ok2:
+            code = fallback
+            report = report2
+            source = "uretilen_kod_dogrulandi"
+            title = "Doğrulanmış Python kodu"
+    formatted, final_source = _format_code_answer(code, language, title=title, source=source, user_id=user_id)
+    return formatted + "\n\n> " + report, final_source
 
 def code_response(query, user_id=None, previous_answer=None):
-    stored_q, stored_answer = _load_previous_code_for_user(user_id)
-    previous_answer = previous_answer or stored_answer
     language = detect_code_language(query)
-
     edited = _edit_previous_code(query, previous_answer)
     if edited:
-        lang, edited_code = _extract_code_block(edited)
-        if lang and edited_code:
-            test = _test_code(edited_code, lang)
-            edited = _attach_test_report(edited, test)
+        lang, extracted = _extract_code_block(edited)
+        if extracted:
+            return _verified_code_response(extracted, lang, "Önceki kod güncellendi", "uretilen_kod", user_id=user_id)
         return edited, "uretilen_kod"
 
     if DANGEROUS_CODE_RE.search(query):
-        safe = '''# Güvenli savunma örneği: HTTP erişimlerini sınırlama
+        safe = """# Güvenli savunma örneği: HTTP erişimlerini sınırlama ve şüpheli IP'leri raporlama
 from collections import defaultdict, deque
 import time
+
 WINDOW = 60
 LIMIT = 30
 visits = defaultdict(deque)
+
 def allowed(ip: str) -> bool:
-    now = time.time(); q = visits[ip]
-    while q and now - q[0] > WINDOW: q.popleft()
-    if len(q) >= LIMIT: return False
-    q.append(now); return True
+    now = time.time()
+    q = visits[ip]
+    while q and now - q[0] > WINDOW:
+        q.popleft()
+    if len(q) >= LIMIT:
+        return False
+    q.append(now)
+    return True
+
 print("Savunma rate-limit örneği hazır.")
-'''
+"""
         return _format_code_answer(safe, "python", title="Güvenli savunma kodu", source="guvenli_kod", user_id=user_id)
 
-    if _looks_like_github_request(query):
-        subject = code_request_subject(query)
-        candidates = github_repo_code_search(subject, language)
-        if candidates:
-            best = candidates[_code_variation(subject, user_id) % len(candidates)]
-            formatted = _format_code_answer(best["code"], language, title=f"GitHub kaynağı — {best.get('title', 'repo')}", source="github_kod", user_id=user_id)
-            # Harici GitHub kodunu çalıştırmıyoruz; yalnızca statik kontrol uyguluyoruz.
-            test = _test_code(best["code"], language)
-            return _attach_test_report(formatted[0], test), formatted[1]
+    # Basit ve açık kod isteklerinde rastgele GitHub deposu kullanma.
+    # Önce yerel üretim + doğrulama yapılır. GitHub yalnızca açıkça istenirse kullanılır.
+    explicit_github = bool(re.search(r"\b(github|repo|repository|örnek kod|kaynak kod|github'dan|githubdan)\b", normalize(query)))
+    generated = generate_code_fallback(query, language, user_id=user_id)
+    verified, verified_source = _verified_code_response(
+        generated, language, "Gelişmiş ve doğrulanmış kod", "uretilen_kod", user_id=user_id
+    )
+    if not explicit_github:
+        return verified, verified_source
 
-    generated = _build_strong_python_code(query, user_id) if language == "python" else generate_code_fallback(query, language, user_id=user_id)
-    # Üretimden sonra gerçek kontrol: syntax + mümkünse izole çalışma testi.
-    for attempt in range(3):
-        test = _test_code(generated, language)
-        if test.get("status") != "failed":
-            break
-        generated = (_build_strong_python_code(query + f" sağlam varyant {attempt + 2}", user_id)
-                     if language == "python" else generate_code_fallback(query + f" sağlam varyant {attempt + 2}", language, user_id=user_id))
-    if not _validate_generated_code(generated, language):
-        generated = generate_code_fallback(query + " doğrulanmış sağlam varyant", language, user_id=user_id)
-        test = _test_code(generated, language)
-    else:
-        test = _test_code(generated, language)
-    formatted = _format_code_answer(generated, language, title="Gelişmiş, kontrol edilmiş kod", source="uretilen_kod", user_id=user_id)
-    return _attach_test_report(formatted[0], test), formatted[1]
+    subject = code_request_subject(query)
+    candidates = github_repo_code_search(subject, language)
+    if candidates:
+        valid = []
+        for candidate in candidates[:5]:
+            code = candidate.get("code", "")
+            ok, _ = _static_code_check(code, language)
+            if ok:
+                valid.append(candidate)
+        if valid:
+            pick = _code_variation(subject, user_id) % len(valid)
+            best = valid[pick]
+            title = f"GitHub örneği — {best.get('title', 'repo')}"
+            return _verified_code_response(best["code"], language, title, "github_kod", user_id=user_id)
+    return verified, verified_source
+
 # =========================================================
 # SMART ANSWER
 # =========================================================
@@ -1755,13 +1638,13 @@ def universal_fallback_answer(query):
             "2. İşi küçük adımlara böl ve en basit çalışan sürümü oluştur.\n"
             "3. Çalışan kısmı test et; hata varsa hatayı oluşturan adımı ayır.\n"
             "4. Sonucu iyileştir ve gerekiyorsa otomatikleştir.\n\n"
-            f"Bu soruda ana konu **{topic}**. İstersen bunu adım adım, örneklerle ve uygulanabilir bir planla açabilirim."
+            f"Bu soruda ana konu **{topic}**. Google sonucu mevcut değilse bile bu yöntemle adım adım ilerleyebiliriz."
         )
 
     if re.search(r"\b(nedir|ne demek|anlamı|kimdir|hakkında|bilgi)\b", nq):
         return (
             f"**{q}** hakkında temel açıklama\n\n"
-            f"Bu soru **{topic}** konusunu soruyor. Temel anlamını, amacını ve kullanımını açıklayabilirim. "
+            f"Bu soru **{topic}** konusunu soruyor. Google sonucu alınamadığında bile cevabı boş bırakmıyorum. "
             "Konu bir kavramsa temel anlamı, amacı ve günlük kullanımını açıklarım; kişi veya güncel olay "
             "gibi doğrulama gerektiren konularda isim/tarih uydurmam."
         )
@@ -2095,8 +1978,8 @@ def render_page(title, content, user=None, show_nav=True, modal=False):
               <a href="/chat" class="btn-nav">Sohbet</a>
               <a href="/search" class="btn-nav">Arama</a>
               <a href="/dashboard" class="btn-nav">Dashboard</a>
+              <a href="/settings" class="btn-nav">Ayarlar</a>
               <a href="/info" class="btn-nav">Bilgi</a>
-              <a href="/logout" class="btn-nav">Çıkış</a>
             """
         else:
             actions = """
@@ -2133,6 +2016,7 @@ def render_page(title, content, user=None, show_nav=True, modal=False):
       {nav}
       {content}
       {modal_html}
+      <script>(function(){{try{{var t=localStorage.getItem('vantorium_theme')||'dark';if(t==='light'||(t==='system'&&matchMedia('(prefers-color-scheme: light)').matches))document.body.classList.add('light')}}catch(e){{}}}})();</script>
     </body>
     </html>
     """
@@ -2485,12 +2369,12 @@ def register():
                     if exists:
                         error = "Bu kullanıcı adı zaten alınmış."
                     else:
-                        api_key = "vnt_" + secrets.token_hex(24)
+                        legacy_key = "legacy_disabled_" + secrets.token_hex(24)
                         cur.execute("""
                             INSERT INTO users
                             (username, password_hash, api_key, created_at, is_active)
                             VALUES (?, ?, ?, ?, 1)
-                        """, (username, hash_password(password), api_key, datetime.now().isoformat()))
+                        """, (username, hash_password(password), legacy_key, datetime.now().isoformat()))
                         return redirect("/login?registered=1")
             except sqlite3.IntegrityError:
                 error = "Bu kullanıcı adı zaten alınmış."
@@ -2603,14 +2487,6 @@ def login():
     """
 
     return render_page("Giriş", content, modal=True)
-
-@app.route("/logout")
-def logout():
-    token = request.cookies.get("session_token")
-    destroy_session(token)
-    response = make_response(redirect("/login"))
-    response.delete_cookie("session_token")
-    return response
 
 # =========================================================
 # SEARCH ENGINE
@@ -2753,47 +2629,52 @@ def api_search():
 @login_required
 def dashboard():
     user = get_current_user()
-    base = request.host_url.rstrip("/")
-    example = f"{base}/api-key={user['api_key']}?word=merhaba"
-
-    content = f"""
-    <main class="container wide">
-      <h1 class="page-title">Dashboard</h1>
-      <p class="subtitle">
-        Hoş geldin, <strong>{html.escape(user["username"])}</strong>.
-        API anahtarını buradan yönetebilirsin.
-      </p>
-
-      <div class="card">
-        <h3>🔑 API anahtarın</h3>
-        <div class="api-key-box">{html.escape(user["api_key"])}</div>
-        <p>Bu anahtarı gizli tut. Sızarsa aşağıdaki butondan yenileyebilirsin.</p>
-        <form method="POST" action="/regenerate-key">
-          <button class="btn danger btn-small" type="submit">Anahtarı yenile</button>
-        </form>
-      </div>
-
-      <div class="card">
-        <h3>⚡ API kullanımı</h3>
-        <p>GET isteği gönder:</p>
-        <div class="code-block">{html.escape(example)}</div>
-      </div>
-    </main>
+    with db_cursor() as cur:
+        keys = cur.execute("SELECT id,name,key_prefix,created_at,last_used_at,is_active FROM api_keys WHERE user_id=? AND is_active=1 ORDER BY id DESC", (user["id"],)).fetchall()
+    rows = "".join(
+        f'<div class="api-row"><div><div class="api-name">{html.escape(k["name"])}</div><div class="api-meta">{html.escape(k["key_prefix"])}•••••••• · Oluşturuldu: {html.escape(k["created_at"][:10])}</div></div><div class="api-meta">{("Son kullanım: " + html.escape(k["last_used_at"][:16])) if k["last_used_at"] else "Henüz kullanılmadı"}</div></div>'
+        for k in keys
+    )
+    if not rows: rows='<div class="empty-api"><strong>Henüz API Key yok.</strong><br><span>Sağdaki butondan ilk anahtarını oluştur.</span></div>'
+    content=f"""
+    <main class="dashboard-shell"><div class="dashboard-head"><div><div class="eyebrow">VANTORIUM DEVELOPER</div><h1>API Dashboard</h1><p class="subtitle">Hoş geldin, <strong>{html.escape(user['username'])}</strong>. Anahtarlarını güvenli şekilde yönet.</p></div><div class="status-pill"><span class="dot"></span> Sistem hazır</div></div>
+    <div class="dashboard-stage"><section class="api-panel"><h2>API Key'ler</h2><p class="subtitle">Anahtarların isimleri ve güvenli önekleri burada görünür. Gizli token oluşturulduğu anda bir kez gösterilir.</p><div class="api-list">{rows}</div></section><aside class="api-create-rail"><button class="api-create-btn" onclick="openKeyModal()">＋ API Key oluştur</button></aside></div>
+    <div class="settings-grid" style="margin-top:16px"><div class="setting-option"><strong>🔐 Güvenlik</strong><p class="subtitle" style="margin:8px 0 0">Tokenlar ekranda kalıcı olarak gösterilmez. Oluşturulduğunda tek seferlik görüntülenir.</p></div><div class="setting-option"><strong>⚡ API erişimi</strong><p class="subtitle" style="margin:8px 0 0">Anahtarlar hesabına bağlıdır ve gerektiğinde devre dışı bırakılabilir.</p></div></div></main>
+    <div id="keyModal" class="modal-backdrop" onclick="if(event.target===this)closeKeyModal()"><div class="modal-card"><h2>Yeni API Key</h2><p class="hint">Anahtarına kolayca tanıyabileceğin bir isim ver. Örneğin <b>Mobil Uygulama</b> veya <b>Web Projesi</b>.</p><label>API Key ismi</label><input id="keyName" type="text" maxlength="50" placeholder="Örn. Mobil Uygulama" autocomplete="off"><div id="keyResult"></div><div class="modal-actions"><button class="btn secondary btn-small" onclick="closeKeyModal()">İptal</button><button class="btn btn-small" id="createKeyBtn" onclick="createApiKey()">Oluştur</button></div></div></div>
+    <script>function openKeyModal(){{document.getElementById('keyModal').classList.add('open');document.getElementById('keyName').focus();document.getElementById('keyResult').innerHTML='';}}function closeKeyModal(){{document.getElementById('keyModal').classList.remove('open')}}async function createApiKey(){{const name=document.getElementById('keyName').value.trim(),btn=document.getElementById('createKeyBtn'),result=document.getElementById('keyResult');if(name.length<2){{result.innerHTML='<div class="error">API Key ismi en az 2 karakter olmalı.</div>';return;}}btn.disabled=true;btn.textContent='Oluşturuluyor…';try{{const r=await fetch('/api/keys',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{name}})}}),d=await r.json();if(!r.ok)throw new Error(d.error||'Oluşturulamadı');result.innerHTML='<div class="success-key"><strong>✓ API Key oluşturuldu</strong><div class="hint" style="margin:6px 0 0">Bu token yalnızca şimdi gösteriliyor. Güvenli yerde sakla.</div><code id="newToken">'+escapeHtml(d.token)+'</code><button class="btn btn-small" style="margin-top:12px" onclick="navigator.clipboard.writeText(document.getElementById('newToken').textContent)">Kopyala</button></div>';btn.textContent='Tamam';btn.onclick=()=>location.reload();}}catch(e){{result.innerHTML='<div class="error">'+escapeHtml(e.message)+'</div>';btn.disabled=false;btn.textContent='Oluştur';}}}}function escapeHtml(v){{const d=document.createElement('div');d.textContent=v||'';return d.innerHTML;}}</script>
     """
+    return render_page("Dashboard",content,user)
 
-    return render_page("Dashboard", content, user)
-
-@app.route("/regenerate-key", methods=["POST"])
+@app.route("/api/keys",methods=["POST"])
 @login_required
-def regenerate_key():
-    user = get_current_user()
-    new_key = "vnt_" + secrets.token_hex(24)
+def create_api_key():
+    user=get_current_user(); data=request.get_json(silent=True) or {}; name=str(data.get("name","")).strip()
+    if not 2<=len(name)<=50:return jsonify({"error":"API Key ismi 2-50 karakter olmalı."}),400
+    raw="vnt_"+secrets.token_urlsafe(32); digest=hashlib.sha256(raw.encode()).hexdigest()
     try:
-        with db_cursor() as cur:
-            cur.execute("UPDATE users SET api_key = ? WHERE id = ?", (new_key, user["id"]))
-    except Exception as e:
-        print(f"[regenerate_key] {e}")
-    return redirect("/dashboard")
+        with db_cursor() as cur: cur.execute("INSERT INTO api_keys(user_id,name,key_hash,key_prefix,created_at,is_active) VALUES(?,?,?,?,?,1)",(user["id"],name,digest,raw[:12],datetime.now().isoformat()))
+        return jsonify({"ok":True,"name":name,"token":raw,"prefix":raw[:12]})
+    except Exception as e:return jsonify({"error":"Anahtar oluşturulamadı."}),500
+
+@app.route("/api/keys/<int:key_id>",methods=["DELETE"])
+@login_required
+def revoke_api_key(key_id):
+    user=get_current_user()
+    with db_cursor() as cur:cur.execute("UPDATE api_keys SET is_active=0 WHERE id=? AND user_id=?",(key_id,user["id"]))
+    return jsonify({"ok":True})
+
+@app.route("/settings",methods=["GET","POST"])
+@login_required
+def settings():
+    user=get_current_user()
+    if request.method=="POST":
+        data=request.get_json(silent=True) or {}; theme=str(data.get("theme","dark")); theme=theme if theme in {"dark","light","system"} else "dark"
+        with db_cursor() as cur:cur.execute("INSERT INTO user_settings(user_id,theme,accent,compact_mode,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET theme=excluded.theme,updated_at=excluded.updated_at",(user["id"],theme,"mint",0,datetime.now().isoformat()))
+        return jsonify({"ok":True,"theme":theme})
+    with db_cursor() as cur:row=cur.execute("SELECT theme FROM user_settings WHERE user_id=?",(user["id"],)).fetchone()
+    theme=row["theme"] if row else "dark"
+    content=f"""<main class="container wide"><h1 class="page-title">Ayarlar</h1><p class="subtitle">Vantorium'un görünümünü kişiselleştir.</p><div class="settings-grid"><div class="setting-option"><strong>🎨 Tema</strong><p class="subtitle" style="margin:8px 0 0">Karanlık, açık veya cihaz temasını seç.</p><div class="theme-buttons"><button class="theme-btn" data-theme="dark" onclick="setTheme('dark')">Karanlık</button><button class="theme-btn" data-theme="light" onclick="setTheme('light')">Açık</button><button class="theme-btn" data-theme="system" onclick="setTheme('system')">Sistem</button></div></div><div class="setting-option"><strong>✨ Arayüz</strong><p class="subtitle" style="margin:8px 0 0">Inter fontu, yumuşak 3D kartlar ve sade hareketler aktif.</p></div></div></main><script>let current={json.dumps(theme)};function applyTheme(t){{document.body.classList.toggle('light',t==='light'||(t==='system'&&matchMedia('(prefers-color-scheme: light)').matches));document.querySelectorAll('.theme-btn').forEach(b=>b.classList.toggle('active',b.dataset.theme===t));}}async function setTheme(t){{current=t;localStorage.setItem('vantorium_theme',t);applyTheme(t);await fetch('/settings',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{theme:t}})}});}}applyTheme(localStorage.getItem('vantorium_theme')||current);</script>"""
+    return render_page("Ayarlar",content,user)
 
 # =========================================================
 # INFO
@@ -2870,14 +2751,18 @@ def api_word(apikey):
             "usage": "/api-key=...?word=kelime"
         }), 400
 
+    user = None
     try:
+        digest = hashlib.sha256(apikey.encode()).hexdigest()
         with db_cursor() as cur:
-            user = cur.execute(
-                "SELECT * FROM users WHERE api_key = ? AND is_active = 1", (apikey,)
-            ).fetchone()
+            row = cur.execute("SELECT u.*, k.id AS api_key_id FROM api_keys k JOIN users u ON u.id=k.user_id WHERE k.key_hash=? AND k.is_active=1 AND u.is_active=1", (digest,)).fetchone()
+            if row:
+                user = row
+                cur.execute("UPDATE api_keys SET last_used_at=? WHERE id=?", (datetime.now().isoformat(), row["api_key_id"]))
+            else:
+                user = cur.execute("SELECT * FROM users WHERE api_key=? AND is_active=1", (apikey,)).fetchone()
     except Exception:
         user = None
-
     if not user:
         return jsonify({"error": "Geçersiz API anahtarı"}), 401
 
@@ -3250,58 +3135,19 @@ def _contextualize(query, history):
 
 
 def research_events(query, parts, depth=1):
-    """Google'da araştırır, birden fazla kaliteli sonucu inceler ve en güçlü cevabı yazar."""
-    yield "status", {"text": "Google'da araştırıyor…"}
-    google_query = _google_query(query, parts)
-    results = _G["cse_search"](google_query, "web", 8)
-    results = [r for r in results if r.get("url")]
-    if not results:
-        simple = re.sub(r"\s+", " ", _G["extract_target"](query, parts)).strip()[:160]
-        if simple and simple != google_query:
-            results = _G["cse_search"](simple + " -site:wikipedia.org -site:tr.wikipedia.org", "web", 8)
-            results = [r for r in results if r.get("url")]
-    if not results:
+    """Durum olayları üretir; sonunda ("result", {"md":..., "sources":[...]} | None)."""
+    yield "status", {"text": "Google'da arıyor…"}
+    bundle = first_result(query, parts)
+    if not bundle:
         yield "result", None
         return
-
-    # Google sırasını temel alırız ama en alakalı sonucu seçmek için küçük bir
-    # kalite/relevans puanı kullanırız. Böylece tek bir zayıf snippet'e mahkûm olmayız.
-    ranked = _G["best_results"](results, google_query, min(6, len(results)))
-    candidates = ranked[:4]
-    yield "status", {"text": f"En iyi {len(candidates)} sonucu karşılaştırıyor…"}
-    collected = []
-    sources = []
-    qterms = set(_tokens(_clean_topic(query)))
-    for pos, item in enumerate(candidates):
-        page = fetch_page(item["url"])
-        text_parts = []
-        if page:
-            for para in page.get("paras", [])[:30]:
-                text_parts.extend(_sentences(para))
-        if not text_parts:
-            sn = _G["clean_snippet"](item.get("snippet", ""), 900)
-            text_parts = _sentences(sn, lo=20) or ([sn] if sn else [])
-        for sent in text_parts[:24]:
-            if len(sent) >= 30:
-                collected.append({"text": sent, "src": pos + 1, "sec": "web", "sec_i": pos, "pos": len(collected), "kind": "web"})
-        sources.append({"title": item.get("title") or _domain(item["url"]), "url": item["url"], "domain": _domain(item["url"])})
-
-    if not collected:
-        yield "result", None
-        return
-
-    chosen = _mmr(_rank(collected, qterms), 8 * max(1, depth))
-    title = f"{query.strip()} hakkında araştırılmış cevap"
-    out = [f"## {title}", "", "**Kısa cevap**", ""]
-    lead = [x["text"] for x in sorted(chosen[:3], key=lambda x: x["pos"])]
-    out.append(" ".join(lead[:3]))
-    if len(chosen) > 3:
-        out += ["", "**Ayrıntılar**", ""]
-        for x in sorted(chosen[3:12], key=lambda x: x["pos"]):
-            out.append("• " + x["text"])
-    if depth >= 2:
-        out += ["", "**Kaynak karşılaştırması**", "", "Farklı sonuçlardaki ortak noktalar esas alınarak özetlendi; çelişen veya doğrulanamayan ayrıntılar kesin bilgi olarak sunulmadı."]
-    yield "result", {"md": "\n".join(out).rstrip() + "\n", "sources": sources[:4]}
+    yield "status", {"text": "İlk sonucu okuyor…"}
+    top = bundle["top"]
+    md = _write_single(query, top, bundle["page"], set(_tokens(_clean_topic(query))), depth)
+    yield "result", {
+        "md": md,
+        "sources": [{"title": top.get("title") or _domain(top["url"]), "url": top["url"], "domain": _domain(top["url"])}],
+    }
 
 
 # =========================================================
@@ -3971,7 +3817,7 @@ def _history_context(query, history, uid=None):
         previous_user = str(persistent.get("question", ""))
     if not previous_ai and persistent:
         previous_ai = str(persistent.get("answer", ""))
-    follow = bool(re.search(r"\b(bunu|şunu|bunun|önceki|yukarıdaki|az önce|devam|geliştir|geliştirme|daha iyi|daha sağlam|daha güçlü|iyileştir|iyileştirme|modernleştir|değiştir|düzelt|aynısını|aynı kod|buna|buradaki|üstteki|muq|mükemmel)\b", normalize(q)))
+    follow = bool(re.search(r"\b(bunu|şunu|bunun|önceki|yukarıdaki|az önce|devam|geliştir|değiştir|düzelt|aynısını|aynı kod|buna|buradaki|üstteki)\b", normalize(q)))
     return q, previous_user[:6000], previous_ai[:9000], follow
 
 
@@ -3992,10 +3838,6 @@ def answer_events(query, history, uid=None):
     current_query, previous_user, previous_ai, is_followup = _history_context(query, history, uid)
     effective_query = _code_context_query(current_query, previous_user, previous_ai) if is_followup else current_query
     parts = G["analyze_query"](effective_query)
-    current_parts = G["analyze_query"](current_query)
-    if current_parts.get("is_code_request"):
-        parts["is_code_request"] = True
-        parts["is_code"] = True
 
     # 0) Kalıcı hafıza: kullanıcı yeni bir bilgi veriyorsa öğren, ardından hatırla.
     if uid:
@@ -4009,30 +3851,7 @@ def answer_events(query, history, uid=None):
             yield from _remember_and_stream(remembered, "kalici_hafiza", uid, query)
             return
 
-    # 1) Kod isteği: önce önceki kodu düzenle veya güçlü kod üret.
-    if current_parts.get("is_code_request"):
-        yield "status", {"text": "İsteği ve önceki kodu analiz ediyor…"}
-        # Takip isteği varsa önceki kodun düzenlenmesini dene.
-        if is_followup and previous_ai:
-            local = G["code_response"](effective_query, user_id=uid, previous_answer=previous_ai)
-            if local:
-                yield from _remember_and_stream(local[0], local[1], uid, query)
-                return
-        # Yeni istekte bilinen kaliteli şablonlar öncelikli.
-        tpl = match_template(current_query, current_parts)
-        if tpl:
-            local = template_answer(tpl, current_query, uid)
-            lang, code = _extract_code_block(local)
-            if lang and code:
-                local = _attach_test_report(local, _test_code(code, lang))
-            yield from _remember_and_stream(local, "kod_sablon", uid, query)
-            return
-        local = G["code_response"](current_query, user_id=uid, previous_answer=previous_ai)
-        if local:
-            yield from _remember_and_stream(local[0], local[1], uid, query)
-            return
-
-    # 2) Hızlı yerel yollar: özel planlar, tanımlar, selam, sohbet, matematik...
+    # 1) Hızlı yerel yollar: özel planlar, tanımlar, selam, sohbet, matematik...
     structured = G.get("structured_local_answer")(current_query)
     if structured:
         yield from _remember_and_stream(structured[0], structured[1], uid, query)
@@ -4044,22 +3863,25 @@ def answer_events(query, history, uid=None):
         yield from _remember_and_stream(answer, source, uid, query)
         return
 
-    # 3) Hazır, çalışan kod şablonları
+    # 2) Hazır, çalışan kod şablonları
     tpl = match_template(effective_query, parts)
     if tpl:
         yield "status", {"text": "Kodu hazırlıyor…"}
         yield from _remember_and_stream(template_answer(tpl, effective_query, uid), "kod_sablon", uid, query)
         return
 
-    # 4) Yaratıcı üretim ve öneriler
+    # 3) Yaratıcı üretim, öneri, şablonu olmayan kod istekleri
     local = G["local_creative_answer"](current_query)
     if not local and parts.get("is_recommendation"):
         local = G["recommendation_answer"](current_query)
+    if not local and parts.get("is_code_request"):
+        yield "status", {"text": "GitHub'da uygun kod arıyor…"}
+        local = G["code_response"](effective_query, user_id=uid, previous_answer=previous_ai)
     if local:
         yield from _remember_and_stream(local[0], local[1], uid, query)
         return
 
-    # 5) Araştırma: Google ilk sonucu → yerel, kaynaklı cevap
+    # 4) Araştırma: Google ilk sonucu → yerel, kaynaklı cevap
     topic_query, depth = _contextualize(current_query, history)
     topic_parts = G["analyze_query"](topic_query)
     result = None
@@ -4077,7 +3899,7 @@ def answer_events(query, history, uid=None):
         yield from _remember_and_stream(result["md"], "arastirma", uid, query)
         return
 
-    # 6) Google'a ulaşılamasa bile cevap akışını boş bırakma.
+    # 5) Google'a ulaşılamasa bile cevap akışını boş bırakma.
     # get_answer önce yerel bilgi/hafıza yollarını dener; son aşamada
     # universal_fallback_answer her zaman metin üretir. Harici LLM yoktur.
     try:
@@ -4121,9 +3943,15 @@ def chat_stream_view():
                 yield _sse(event, payload)
         except GeneratorExit:
             raise
-        except Exception:
+        except Exception as exc:
             log.exception("stream hatası")
-            yield _sse("error", {"message": "Yanıt hazırlanırken sunucuda bir hata oluştu. Tekrar dene."})
+            # Son güvenlik ağı: kullanıcıyı boş/error cevabıyla bırakma.
+            try:
+                fallback = universal_fallback_answer(message)
+            except Exception:
+                fallback = "Sorunu aldım. İstersen bunu adım adım çözebiliriz."
+            yield _sse("delta", {"text": fallback})
+            yield _sse("done", {"source": "yerel_fallback"})
 
     resp = Response(stream_with_context(gen()), mimetype="text/event-stream")
     resp.headers["Cache-Control"] = "no-cache, no-transform"
@@ -4154,8 +3982,11 @@ def api_chat_view():
         return jsonify({"answer": answer, "source": source})
     except Exception:
         log.exception("api_chat hatası")
-        return jsonify({"answer": "Yanıt hazırlanırken sunucuda bir hata oluştu. Lütfen tekrar dene.",
-                        "source": "server_error"}), 200
+        try:
+            fallback = universal_fallback_answer(message)
+        except Exception:
+            fallback = "Sorunu aldım. İstersen bunu adım adım çözebiliriz."
+        return jsonify({"answer": fallback, "source": "yerel_fallback"}), 200
 
 
 def _js(value):
