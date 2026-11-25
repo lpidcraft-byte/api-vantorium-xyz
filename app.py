@@ -20,7 +20,7 @@ from datetime import datetime, timedelta
 from functools import wraps
 from contextlib import contextmanager
 from collections import Counter, defaultdict, deque
-from threading import Lock
+from threading import Lock, BoundedSemaphore
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask import (
     Flask, request, jsonify, Response, redirect, make_response, session,
@@ -43,33 +43,29 @@ if os.environ.get("TRUST_PROXY", "").lower() == "1":
 # =========================================================
 
 def _resolve_db_path():
-    """
-    Railway / Docker / yerel ortamda kalıcı DB yolu seçer.
-    Öncelik:
-      1. DB_PATH ortam değişkeni
-      2. /data/vantorium.db  (volume mount için)
-      3. uygulamanın yanındaki data/ klasörü
+    """Ücretli Railway /data volume gerektirmeden yerel uygulama klasörünü kullanır.
+
+    Öncelik: DB_PATH -> ./instance/vantorium.db -> sistem temp.
+    Not: Bu ücretsiz yerel yöntem container yeniden oluşturulunca garanti edilen
+    kalıcılık sağlamaz. Gerçek deploy-kalıcı depolama için DB_PATH'i harici bir
+    veritabanına taşıyan bir adaptör veya ücretsiz/harici DB servisi gerekir.
     """
     env_path = os.environ.get("DB_PATH", "").strip()
     if env_path:
-        return env_path
-
-    for candidate in ("/data/vantorium.db", "/app/data/vantorium.db"):
-        parent = os.path.dirname(candidate)
-        if os.path.isdir(parent) or os.access(os.path.dirname(parent) or "/", os.W_OK):
-            try:
-                os.makedirs(parent, exist_ok=True)
-                return candidate
-            except Exception:
-                pass
+        parent = os.path.dirname(os.path.abspath(env_path))
+        try:
+            os.makedirs(parent, exist_ok=True)
+            return env_path
+        except Exception:
+            pass
 
     base = os.path.dirname(os.path.abspath(__file__))
-    data_dir = os.path.join(base, "data")
+    data_dir = os.path.join(base, "instance")
     try:
         os.makedirs(data_dir, exist_ok=True)
+        return os.path.join(data_dir, "vantorium.db")
     except Exception:
-        data_dir = tempfile.gettempdir()
-    return os.path.join(data_dir, "vantorium.db")
+        return os.path.join(tempfile.gettempdir(), "vantorium.db")
 
 
 DB_FILE = _resolve_db_path()
@@ -161,6 +157,18 @@ def init_db():
                     )
                 """)
                 cur.execute("""
+                    CREATE TABLE IF NOT EXISTS user_memory (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id INTEGER NOT NULL,
+                        memory_key TEXT NOT NULL,
+                        memory_value TEXT NOT NULL,
+                        memory_type TEXT DEFAULT 'conversation',
+                        updated_at TEXT NOT NULL,
+                        UNIQUE(user_id, memory_key),
+                        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+                    )
+                """)
+                cur.execute("""
                     CREATE TABLE IF NOT EXISTS sessions (
                         token TEXT PRIMARY KEY,
                         user_id INTEGER NOT NULL,
@@ -189,6 +197,7 @@ def init_db():
                         created_at REAL NOT NULL
                     )
                 """)
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_user_memory_user ON user_memory(user_id)")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at)")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_code_files_user ON code_files(user_id)")
@@ -248,6 +257,109 @@ def memory_save(word, answer, confidence, source):
             """, (word, answer, confidence, source, datetime.now().isoformat()))
     except Exception as e:
         print(f"[memory_save] hata: {e}")
+
+
+def user_memory_get(user_id, memory_key):
+    """Kullanıcıya özel kalıcı hafızadan en son kaydı getirir."""
+    if not user_id or not memory_key:
+        return None
+    try:
+        with db_cursor() as cur:
+            row = cur.execute(
+                "SELECT memory_value FROM user_memory WHERE user_id = ? AND memory_key = ?",
+                (user_id, normalize(memory_key))
+            ).fetchone()
+            return row["memory_value"] if row else None
+    except Exception:
+        return None
+
+
+def user_memory_save(user_id, memory_key, memory_value, memory_type="conversation"):
+    """Kullanıcı hafızasını SQLite'a kalıcı olarak kaydeder/günceller."""
+    if not user_id or not memory_key or not memory_value:
+        return
+    key = normalize(memory_key)[:500]
+    value = str(memory_value).strip()[:12000]
+    if not key or not value:
+        return
+    try:
+        with db_cursor() as cur:
+            cur.execute("""
+                INSERT INTO user_memory (user_id, memory_key, memory_value, memory_type, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(user_id, memory_key) DO UPDATE SET
+                    memory_value = excluded.memory_value,
+                    memory_type = excluded.memory_type,
+                    updated_at = excluded.updated_at
+            """, (user_id, key, value, memory_type, datetime.now().isoformat()))
+    except Exception as e:
+        print(f"[user_memory_save] hata: {e}")
+
+
+def remember_conversation(user_id, query, answer, source="local"):
+    """Hem soru-cevap eşleşmesini hem de kısa konuşma kaydını kalıcılaştırır."""
+    if not user_id or not query or not answer:
+        return
+    # Aynı soruya gelen son cevabı hızlı erişim için sakla.
+    user_memory_save(user_id, query, answer, "conversation")
+    # Son konuşmayı ayrıca sabit bir kayıtta tut; sonraki isteklerde bağlam olarak kullanılabilir.
+    user_memory_save(
+        user_id,
+        "__last_conversation__",
+        json.dumps({"question": query[:6000], "answer": answer[:12000], "source": source,
+                    "updated_at": datetime.now().isoformat()}, ensure_ascii=False),
+        "last_conversation"
+    )
+
+
+def learn_user_fact(user_id, query):
+    """Basit ve deterministik kişisel bilgi öğrenme; harici yapay zekâ kullanmaz."""
+    if not user_id:
+        return
+    q = str(query or '').strip()
+    patterns = [
+        (r"^(?:benim )?adım\s+(.+)$", "__name__", "fact"),
+        (r"^bana\s+(.+?)\s+(?:diye )?(?:hitap et|de)$", "__preferred_name__", "fact"),
+        (r"^ben\s+(.+?)\s+seviyorum$", "__likes__", "fact"),
+        (r"^favorim\s+(.+)$", "__favorite__", "fact"),
+    ]
+    for pattern, key, kind in patterns:
+        m = re.match(pattern, q, re.I)
+        if m:
+            value = m.group(1).strip(" .,!?")
+            if value:
+                user_memory_save(user_id, key, value, kind)
+            return
+
+
+def personal_memory_answer(user_id, query):
+    if not user_id:
+        return None
+    q = normalize(query)
+    if re.search(r"\b(adım ne|benim adım ne|ismim ne|adımı hatırlıyor musun)\b", q):
+        name = user_memory_get(user_id, "__name__") or user_memory_get(user_id, "__preferred_name__")
+        return f"Adın **{name}**. Bunu kalıcı hafızama kaydettim." if name else None
+    if re.search(r"\b(bana nasıl hitap et|hangi isimle hitap et)\b", q):
+        name = user_memory_get(user_id, "__preferred_name__") or user_memory_get(user_id, "__name__")
+        return f"Sana **{name}** diye hitap ediyorum." if name else None
+    if re.search(r"\bneyi seviyorum|neleri seviyorum\b", q):
+        likes = user_memory_get(user_id, "__likes__")
+        return f"Daha önce **{likes}** sevdiğini söylemiştin." if likes else None
+    return None
+
+
+def persistent_memory_answer(user_id, query):
+    """Kullanıcının daha önce sorduğu aynı soruya verilen kalıcı cevabı bulur."""
+    return user_memory_get(user_id, query)
+
+
+def save_code_memory(user_id, query, code_answer):
+    if not user_id or not query or not code_answer:
+        return
+    user_memory_save(user_id, "__last_code_request__", json.dumps({
+        "question": query[:6000], "answer": code_answer[:12000],
+        "updated_at": datetime.now().isoformat()
+    }, ensure_ascii=False), "code")
 
 
 def save_code_file(content, language, filename=None, user_id=None, ttl_hours=48):
@@ -921,11 +1033,27 @@ def _format_code_answer(code, language, title="Kod", source="uretilen_kod", user
 def code_response(query, user_id=None):
     language = detect_code_language(query)
     if DANGEROUS_CODE_RE.search(query):
-        return (
-            "Bu istek saldırı/zararlı yazılım koduna giriyorsa onu GitHub'dan çekip veremem. "
-            "Kendi sistemini test ediyorsan güvenli bir yük testi veya laboratuvar örneği hazırlayabilirim.",
-            "guvenlik"
-        )
+        safe = '''# Güvenli savunma örneği: HTTP erişimlerini sınırlama ve şüpheli IP'leri raporlama
+from collections import defaultdict, deque
+import time
+
+WINDOW = 60
+LIMIT = 30
+visits = defaultdict(deque)
+
+def allowed(ip: str) -> bool:
+    now = time.time()
+    q = visits[ip]
+    while q and now - q[0] > WINDOW:
+        q.popleft()
+    if len(q) >= LIMIT:
+        return False
+    q.append(now)
+    return True
+
+print("Savunma rate-limit örneği hazır.")
+'''
+        return _format_code_answer(safe, "python", title="Güvenli savunma kodu", source="guvenli_kod", user_id=user_id)
     subject = code_request_subject(query)
     candidates = github_repo_code_search(subject, language)
     if candidates:
@@ -1551,6 +1679,65 @@ def render_page(title, content, user=None, show_nav=True, modal=False):
     """
 
 # =========================================================
+# UNDER ATTACK — uygulama katmanı DDoS/abuse savunması
+# =========================================================
+UNDER_ATTACK = os.environ.get("UNDER_ATTACK", "1").strip().lower() not in {"0", "false", "off", "no"}
+MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", str(256 * 1024)))
+MAX_CONCURRENT = max(8, int(os.environ.get("MAX_CONCURRENT", "48")))
+_REQUEST_SEM = BoundedSemaphore(MAX_CONCURRENT)
+_GLOBAL_REQ = deque()
+_IP_REQ = defaultdict(deque)
+_ATTACK_BLOCKS = {}
+_ATTACK_LOCK = Lock()
+_SUSPICIOUS_PATHS = re.compile(r"(?:/\.env(?:$|/)|/wp-admin|/wp-login|/xmlrpc\.php|/phpmyadmin|/vendor/phpunit|/cgi-bin/|/actuator(?:/|$)|/server-status)", re.I)
+
+def _attack_retry(ip):
+    until = _ATTACK_BLOCKS.get(ip, 0)
+    if until > time.time():
+        return max(1, int(until - time.time()))
+    _ATTACK_BLOCKS.pop(ip, None)
+    return 0
+
+def _under_attack_gate():
+    if not UNDER_ATTACK:
+        return None
+    path = request.path or "/"
+    ip = client_ip()
+    retry = _attack_retry(ip)
+    if retry:
+        resp = jsonify({"error": "Vantorium Under Attack koruması aktif. Lütfen biraz bekleyin.", "retry_after": retry})
+        resp.status_code = 429
+        resp.headers["Retry-After"] = str(retry)
+        return resp
+    if request.content_length and request.content_length > MAX_BODY_BYTES:
+        return jsonify({"error": "İstek gövdesi çok büyük."}), 413
+    if _SUSPICIOUS_PATHS.search(path):
+        with _ATTACK_LOCK:
+            _ATTACK_BLOCKS[ip] = time.time() + 900
+        return jsonify({"error": "İstek engellendi."}), 403
+
+    now = time.time()
+    with _ATTACK_LOCK:
+        while _GLOBAL_REQ and now - _GLOBAL_REQ[0] > 1:
+            _GLOBAL_REQ.popleft()
+        bucket = _IP_REQ[ip]
+        while bucket and now - bucket[0] > 10:
+            bucket.popleft()
+        _GLOBAL_REQ.append(now)
+        bucket.append(now)
+        # Burst limiti: normal kullanım etkilenmez, bot/flood trafiği kısa sürede kesilir.
+        if len(bucket) > (35 if request.path.startswith('/api/chat') else 60):
+            _ATTACK_BLOCKS[ip] = now + (600 if len(bucket) > 90 else 120)
+            return jsonify({"error": "Flood koruması devreye girdi. Lütfen daha sonra tekrar deneyin."}), 429
+        if len(_GLOBAL_REQ) > 180:
+            return jsonify({"error": "Sunucu yoğunluğu nedeniyle istek kısa süreli sınırlandı."}), 503
+
+    if not _REQUEST_SEM.acquire(blocking=False):
+        return jsonify({"error": "Sunucu şu anda yoğun. Birkaç saniye sonra tekrar dene."}), 503
+    request.environ["_vx_sem_acquired"] = True
+    return None
+
+# =========================================================
 # SITE PROTECTION: HUMAN GATE + RATE LIMITING
 # =========================================================
 
@@ -1693,6 +1880,25 @@ border-radius:50%;animation:spin .8s linear infinite;margin-left:auto}}
 }})();
 </script></body></html>"""
     return make_response(page, 200)
+
+
+@app.before_request
+def under_attack_guard():
+    return _under_attack_gate()
+
+
+@app.after_request
+def release_under_attack_slot(response):
+    if request.environ.pop("_vx_sem_acquired", False):
+        try:
+            _REQUEST_SEM.release()
+        except ValueError:
+            pass
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    return response
 
 
 @app.before_request
@@ -3219,6 +3425,15 @@ def _stream_text(text, source):
     yield "done", {"source": source}
 
 
+def _remember_and_stream(text, source, uid, query):
+    text = text or ""
+    if uid and text:
+        remember_conversation(uid, query, text, source)
+        if source in {"github_kod", "uretilen_kod", "kod_sablon", "github_kod_dosya", "uretilen_kod_dosya"}:
+            save_code_memory(uid, query, text)
+    yield from _stream_text(text, source)
+
+
 def answer_events(query, history, uid=None):
     """(olay, veri) çiftleri üretir: status, sources, delta, done."""
     G = _G
@@ -3226,18 +3441,30 @@ def answer_events(query, history, uid=None):
     q_norm = G["normalize"](query)
     dataset = G.get("DATASET", {})
 
+    # 0) Kalıcı hafıza: kullanıcı yeni bir bilgi veriyorsa öğren, ardından hatırla.
+    if uid:
+        learn_user_fact(uid, query)
+        personal = personal_memory_answer(uid, query)
+        if personal:
+            yield from _remember_and_stream(personal, "kalici_hafiza", uid, query)
+            return
+        remembered = persistent_memory_answer(uid, query)
+        if remembered:
+            yield from _remember_and_stream(remembered, "kalici_hafiza", uid, query)
+            return
+
     # 1) Hızlı yerel yollar: selam, sohbet, matematik, riskli istekler, veri seti
     if (parts.get("is_greeting") or parts.get("is_smalltalk") or parts.get("is_math")
             or G["DANGEROUS_CODE_RE"].search(query) or (q_norm in dataset and dataset[q_norm])):
         answer, source = G["get_answer"](query)
-        yield from _stream_text(answer, source)
+        yield from _remember_and_stream(answer, source, uid, query)
         return
 
     # 2) Hazır, çalışan kod şablonları
     tpl = match_template(query, parts)
     if tpl:
         yield "status", {"text": "Kodu hazırlıyor…"}
-        yield from _stream_text(template_answer(tpl), "kod_sablon")
+        yield from _remember_and_stream(template_answer(tpl), "kod_sablon", uid, query)
         return
 
     # 3) Yaratıcı üretim, öneri, şablonu olmayan kod istekleri
@@ -3248,7 +3475,7 @@ def answer_events(query, history, uid=None):
         yield "status", {"text": "GitHub'da uygun kod arıyor…"}
         local = G["code_response"](query, user_id=uid)
     if local:
-        yield from _stream_text(local[0], local[1])
+        yield from _remember_and_stream(local[0], local[1], uid, query)
         return
 
     # 4) Araştırma: Google ilk sonucu → yerel, kaynaklı cevap
@@ -3266,17 +3493,20 @@ def answer_events(query, history, uid=None):
 
     if result:
         yield "sources", {"items": result["sources"]}
-        yield from _stream_text(result["md"], "arastirma")
+        yield from _remember_and_stream(result["md"], "arastirma", uid, query)
         return
 
     # 5) Google'a ulaşılamasa bile cevap akışını boş bırakma.
     # get_answer önce yerel bilgi/hafıza yollarını dener; son aşamada
     # universal_fallback_answer her zaman metin üretir. Harici LLM yoktur.
-    answer, source = G["get_answer"](topic_query)
+    try:
+        answer, source = G["get_answer"](topic_query)
+    except Exception:
+        log.exception("fallback cevap hatası")
+        answer, source = universal_fallback_answer(topic_query), "yerel_fallback"
     if not answer or not str(answer).strip():
-        answer = universal_fallback_answer(topic_query)
-        source = "yerel_fallback"
-    yield from _stream_text(answer, source)
+        answer, source = universal_fallback_answer(topic_query), "yerel_fallback"
+    yield from _remember_and_stream(answer, source, uid, query)
 
 
 def _sse(event, payload):
@@ -3353,8 +3583,8 @@ def _js(value):
 
 def chat_view():
     user = _G["get_current_user"]()
-    mode = {"ai": True, "label": "Vantorium motoru",
-            "hint": "Google'daki ilk sonuç okunur; cevap yerel olarak hazırlanır."}
+    mode = {"ai": True, "protected": True, "label": "Vantorium • Korumalı",
+            "hint": "Google ilk sonuç + yerel cevap motoru • Under Attack koruması aktif."}
     page = CHAT_HTML.replace("__USER_JSON__", _js(user["username"])).replace("__MODE_JSON__", _js(mode))
     return _G["render_page"]("Sohbet", page, user, show_nav=False)
 
@@ -3424,7 +3654,12 @@ html,body{height:100%;overflow:hidden}
 .vx-title{flex:1;min-width:0;font-size:14.5px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .vx-mode{display:flex;align-items:center;gap:7px;padding:5px 11px;border:1px solid var(--line);border-radius:999px;font-size:12.5px;color:var(--soft)}
 .vx-mode i{width:7px;height:7px;border-radius:50%;background:var(--muted)}
-.vx-mode.ai i{background:var(--accent)}
+.vx-mode.ai i{background:var(--accent)}.vx-mode.protected{border-color:rgba(45,212,167,.28);background:rgba(45,212,167,.06);box-shadow:0 0 0 1px rgba(45,212,167,.04) inset}.vx-mode.protected i{background:var(--accent);box-shadow:0 0 10px rgba(45,212,167,.7)}
+.vx-top{background:linear-gradient(180deg,rgba(17,25,34,.98),rgba(12,17,23,.94));backdrop-filter:blur(16px)}
+.vx-composer{background:linear-gradient(145deg,#18232e,#131c25);box-shadow:0 16px 45px rgba(0,0,0,.42),0 0 0 1px rgba(255,255,255,.015) inset}
+.vx-send{box-shadow:0 7px 22px rgba(45,212,167,.18)}
+.vx-welcome{max-width:720px;margin-inline:auto}.vx-welcome:before{content:"";display:block;width:52px;height:4px;border-radius:99px;background:linear-gradient(90deg,var(--accent),transparent);margin-bottom:18px}
+
 .vx-scroll{flex:1 1 auto;min-height:0;overflow-y:auto;overscroll-behavior:contain;-webkit-overflow-scrolling:touch;scrollbar-width:thin;scrollbar-color:#2b3947 transparent}
 .vx-thread{max-width:740px;margin:0 auto;padding:28px 20px 170px}
 
@@ -3925,6 +4160,7 @@ html,body{height:100%;overflow:hidden}
   /* --- Başlat --- */
   const badge = $('modeBadge');
   badge.classList.toggle('ai', !!MODE.ai);
+  badge.classList.toggle('protected', !!MODE.protected);
   badge.title = MODE.hint;
   badge.querySelector('span').textContent = MODE.label;
   convs = load();
@@ -3950,5 +4186,6 @@ register_ai(app, globals())
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
     print(f"[Vantorium] DB path : {DB_FILE}")
+    print(f"[Vantorium] Under Attack: {UNDER_ATTACK}")
     print(f"[Vantorium] Code dir: {CODE_FILES_DIR}")
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
