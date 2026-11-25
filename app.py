@@ -2324,6 +2324,26 @@ def record_failure(ip, kind="login", limit=8, window=600, ban_seconds=1800):
     return False
 
 
+# API KEY bazli limiter: Railway/Proxy arkasinda tum istemcilerin ayni IP
+# gorunmesi nedeniyle genel IP limiter API endpointini etkilemez.
+_API_KEY_BUCKETS = defaultdict(deque)
+_API_KEY_RATE_LIMIT = 60
+_API_KEY_RATE_WINDOW = 60
+
+def api_key_rate_allowed(apikey):
+    digest = hashlib.sha256((apikey or "").encode("utf-8")).hexdigest()
+    now = time.time()
+    with _RATE_LOCK:
+        bucket = _API_KEY_BUCKETS[digest]
+        while bucket and now - bucket[0] > _API_KEY_RATE_WINDOW:
+            bucket.popleft()
+        if len(bucket) >= _API_KEY_RATE_LIMIT:
+            retry = max(1, int(_API_KEY_RATE_WINDOW - (now - bucket[0])))
+            return False, retry
+        bucket.append(now)
+    return True, 0
+
+
 def rate_limit(limit=12, window=60):
     def decorator(func):
         @wraps(func)
@@ -2957,8 +2977,17 @@ def info():
 # EXTERNAL API
 # =========================================================
 
+@app.route("/api/health", methods=["GET"])
+def api_health():
+    return jsonify({
+        "ok": True,
+        "service": "Vantorium",
+        "engine": "Vantorium Engine 10.0",
+        "rate_limit": {"limit": _API_KEY_RATE_LIMIT, "window_seconds": _API_KEY_RATE_WINDOW}
+    })
+
+
 @app.route("/api-key=<apikey>", methods=["GET"])
-@rate_limit(30, 60)
 def api_word(apikey):
     word = request.args.get("word", "").strip()
 
@@ -2982,6 +3011,19 @@ def api_word(apikey):
         user = None
     if not user:
         return jsonify({"error": "Geçersiz API anahtarı"}), 401
+
+    # API endpointi genel IP rate-limitinden bağımsızdır.
+    # Her API anahtarı kendi kotasına sahiptir. Böylece Railway proxy IP'si
+    # bütün kullanıcıları tek bir bucket'a dolduramaz.
+    allowed, retry = api_key_rate_allowed(apikey)
+    if not allowed:
+        resp = jsonify({
+            "error": "API rate limitine ulaşıldı.",
+            "retry_after": retry
+        })
+        resp.status_code = 429
+        resp.headers["Retry-After"] = str(retry)
+        return resp
 
     start = time.time()
     answer, source = get_answer(word, user_id=user["id"])
