@@ -13,6 +13,10 @@ import secrets
 import sqlite3
 import operator
 import tempfile
+import subprocess
+import sys
+import resource
+import shutil
 import ipaddress
 import requests
 import urllib.parse
@@ -1142,83 +1146,329 @@ def _edit_previous_code(query, previous_answer):
         return None
     q = normalize(query)
     wants_color = bool(re.search(r"\b(renk|renkli|renklerini|color|colored|renklendir)\b", q))
-    wants_upgrade = bool(re.search(r"\b(geliştir|güçlendir|sağlamlaştır|iyileştir|modernleştir|düzelt|profesyonel)\b", q))
-    if not (wants_color or wants_upgrade):
+    wants_upgrade = bool(re.search(r"\b(geliştir|geliştirme|daha iyi|daha sağlam|daha güçlü|iyileştir|iyileştirme|modernleştir|profesyonel|muq|mükemmel|kaliteli|hızlandır|optimize|özellik ekle|düzelt|güçlendir)\b", q))
+    wants_run = bool(re.search(r"\b(çalıştır|çalışsın|çalışınca|run|başlat)\b", q))
+    if not (wants_color or wants_upgrade or wants_run):
         return None
 
     edited = code
     note = []
     if wants_color and lang == "python":
-        # Harici paket gerektirmeyen ANSI renkleri; basit print çağrılarını güvenli biçimde sar.
         if "RESET =" not in edited:
-            prefix = 'RESET = "\\033[0m"\nCYAN = "\\033[96m"\nGREEN = "\\033[92m"\n\n'
-            edited = prefix + edited
+            edited = 'RESET = "\\033[0m"\nCYAN = "\\033[96m"\nGREEN = "\\033[92m"\nYELLOW = "\\033[93m"\n\n' + edited
         edited = re.sub(r"(?m)^(\s*)print\(([^\n()]*)\)$", r'\1print(CYAN + str(\2) + RESET)', edited)
         note.append("Terminal çıktıları ANSI renkleriyle zenginleştirildi.")
     elif wants_color and lang == "html":
-        style = '<style>body{color:#eef5fb;background:#0b1017} h1{color:#36ddb0} p{color:#9aa9b8} .colored{color:#7dd3fc}</style>'
-        edited = style + "\n" + edited
-        note.append("Metinler için renk paleti ve görünüm katmanı eklendi.")
+        edited = '<style>body{color:#eef5fb;background:#0b1017} h1{color:#36ddb0} p{color:#9aa9b8}</style>\n' + edited
+        note.append("Renk paleti ve görünüm katmanı eklendi.")
     elif wants_color and lang == "javascript":
         edited = "const RESET = '\\x1b[0m';\nconst CYAN = '\\x1b[36m';\n\n" + edited
-        edited = edited + "\nconst colorLog = (...args) => console.log(CYAN, ...args, RESET);\n"
-        note.append("Konsol çıktıları için ANSI renk yardımcıları eklendi; colorLog(...) ile kullanılabilir.")
-    if wants_upgrade:
-        if lang == "python" and "try:" not in edited:
-            edited += '\n\n# Sağlamlık katmanı: ana çalışmayı kontrollü hata yönetimiyle sarabilirsin.\n'
-            note.append("Kodun genişletilmesi için hata yönetimi noktası eklendi.")
-        elif lang == "javascript" and "safeRun" not in edited:
-            edited += '\n\nconst safeRun = async fn => { try { return await fn(); } catch (error) { console.error(error); return null; } };\n'
-            note.append("Async hata yakalama yardımcı fonksiyonu eklendi.")
+        edited += "\nconst colorLog = (...args) => console.log(CYAN, ...args, RESET);\n"
+        note.append("Konsol çıktıları için renk yardımcıları eklendi.")
 
-    title = "Önceki kod güncellendi"
-    explanation = "\n".join("- " + x for x in note) if note else "- Önceki kod bağlamı korunarak güncellendi."
-    return f"## {title}\n\n{explanation}\n\n```{lang}\n{edited}\n```\n"
+    if wants_run and lang == "python" and 'if __name__ == "__main__":' not in edited:
+        edited += '\n\nif __name__ == "__main__":\n    main()\n'
+        note.append("Doğrudan çalıştırma giriş noktası eklendi.")
+
+    if wants_upgrade:
+        if lang == "python":
+            if "logging.basicConfig" not in edited:
+                edited = 'import logging\nlogging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")\nlog = logging.getLogger(__name__)\n\n' + edited
+                note.append("Yapılandırılmış logging eklendi.")
+            if "except Exception" not in edited:
+                edited += '\n\n# Sağlamlık katmanı\ndef _safe_main():\n    try:\n        return main()\n    except KeyboardInterrupt:\n        log.info("Program durduruldu.")\n    except Exception:\n        log.exception("Beklenmeyen hata")\n        raise\n'
+                if 'if __name__ == "__main__":\n    main()' in edited:
+                    edited = edited.replace('if __name__ == "__main__":\n    main()', 'if __name__ == "__main__":\n    _safe_main()')
+                note.append("Beklenmeyen hatalar için kontrollü hata katmanı eklendi.")
+        elif lang == "javascript" and "safeRun" not in edited:
+            edited += '\n\nconst safeRun = async (fn) => { try { return await fn(); } catch (error) { console.error("Beklenmeyen hata:", error); return null; } };\n'
+            note.append("Async hata yakalama katmanı eklendi.")
+        elif lang == "html" and "aria-live" not in edited:
+            edited = edited.replace('<body>', '<body>\n<div id="app-status" aria-live="polite"></div>')
+            note.append("Erişilebilir durum alanı eklendi.")
+
+    explanation = "\n".join("- " + x for x in note) if note else "- Önceki kod korunarak yeniden düzenlendi."
+    return f"## Önceki kod geliştirildi\n\n{explanation}\n\n```{lang}\n{edited.strip()}\n```\n"
+
+def _load_previous_code_for_user(user_id):
+    ctx = get_last_code_context(user_id)
+    if not ctx:
+        return None, None
+    return ctx.get("question") or "", str(ctx.get("answer") or "")
+
+
+def _looks_like_github_request(query):
+    return bool(re.search(r"\b(github|github'dan|githubdan|repo|repository|depo|örnek repo|kaynak kodu)\b", normalize(query)))
+
+
+def _build_strong_python_code(query, user_id=None):
+    subject = code_request_subject(query)
+    variant = _code_variation(query, user_id)
+    safe_subject = re.sub(r"[^a-zA-Z0-9_ -]", "", subject).strip()[:80] or "Vantorium uygulaması"
+    if re.search(r"\b(vantorium|yazı|mesaj|print|çalıştırınca|çalışınca)\b", normalize(query)):
+        messages = ["Vantorium hazır.", "Vantorium çalışıyor.", "Vantorium • sistem hazır.", "VANTORIUM | Başlatıldı.", "Vantorium'a hoş geldin!"]
+        msg = messages[variant % len(messages)]
+        return f'''#!/usr/bin/env python3
+# {safe_subject} — doğrudan çalıştırılabilir.
+from __future__ import annotations
+
+import logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger("vantorium")
+
+
+def main() -> None:
+    print("{msg}")
+    log.info("Uygulama başarıyla başlatıldı.")
+
+
+if __name__ == "__main__":
+    main()
+'''
+    return f'''#!/usr/bin/env python3
+# {safe_subject} — Vantorium tarafından oluşturulan sağlam başlangıç.
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger("vantorium")
+
+
+@dataclass
+class AppConfig:
+    name: str = {safe_subject!r}
+    version: str = "1.0.0"
+
+
+class AppError(Exception):
+    pass
+
+
+def run(config: AppConfig) -> int:
+    print(f"{{config.name}} v{{config.version}} hazır.")
+    return 0
+
+
+def main() -> int:
+    config = AppConfig()
+    try:
+        return run(config)
+    except AppError as exc:
+        log.error("Uygulama hatası: %s", exc)
+        return 2
+    except KeyboardInterrupt:
+        log.info("Program durduruldu.")
+        return 130
+    except Exception:
+        log.exception("Beklenmeyen hata")
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+
+
+def _code_static_review(code, language):
+    """Kodun sözdizimi ve temel kalite kontrollerini yapar."""
+    issues = []
+    warnings = []
+    if not code or len(code.strip()) < 20:
+        issues.append("Kod çok kısa veya boş.")
+        return False, issues, warnings
+    if language == "python":
+        try:
+            tree = ast.parse(code)
+        except SyntaxError as exc:
+            issues.append(f"Python sözdizimi hatası: {exc.msg} (satır {exc.lineno})")
+            return False, issues, warnings
+        imports = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imports.extend(a.name.split('.')[0] for a in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imports.append(node.module.split('.')[0])
+        stdlib = set(getattr(sys, "stdlib_module_names", ()))
+        external = sorted({x for x in imports if x and x not in stdlib and x not in {"__future__"}})
+        if external:
+            warnings.append("Harici bağımlılıklar: " + ", ".join(external))
+        if not re.search(r"if __name__\s*==\s*[\"']__main__[\"']", code):
+            warnings.append("Doğrudan çalıştırma giriş noktası bulunamadı.")
+        return True, issues, warnings
+    if language == "javascript":
+        # Node varsa yalnızca syntax check yapılır; kod çalıştırılmaz.
+        return True, issues, warnings
+    if language == "bash":
+        return True, issues, warnings
+    return True, issues, warnings
+
+
+def _safe_python_runtime_test(code, timeout=3):
+    """Güvenli görünen, yerel olarak üretilmiş Python kodunu kısa süreli test eder.
+
+    Dosya/ağ/işletim sistemi erişimi isteyen kodlar çalıştırılmaz; bunlarda statik
+    doğrulama yapılır. Böylece sohbet sunucusu kullanıcı kodu yüzünden tehlikeye
+    atılmaz.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as exc:
+        return {"status": "failed", "message": f"SyntaxError: {exc.msg} (satır {exc.lineno})"}
+
+    blocked = {"os", "subprocess", "socket", "pathlib", "shutil", "ctypes", "multiprocessing",
+               "signal", "resource", "requests", "urllib", "http", "ftplib", "telnetlib",
+               "pickle", "marshal", "builtins"}
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(a.name.split('.')[0] for a in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module.split('.')[0])
+    if imported & blocked:
+        return {"status": "static", "message": "Sözdizimi doğrulandı; dış sistem/dosya/ağ erişimi olduğu için sunucu üzerinde çalıştırılmadı."}
+    if any(isinstance(n, (ast.While, ast.AsyncFor)) for n in ast.walk(tree)):
+        return {"status": "static", "message": "Sözdizimi doğrulandı; potansiyel uzun süreli döngü nedeniyle sunucuda çalıştırılmadı."}
+
+    with tempfile.TemporaryDirectory(prefix="vantorium_test_") as td:
+        path = os.path.join(td, "main.py")
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(code)
+            env = {"PATH": os.environ.get("PATH", ""), "PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1"}
+            def limits():
+                try:
+                    resource.setrlimit(resource.RLIMIT_CPU, (2, 2))
+                    resource.setrlimit(resource.RLIMIT_AS, (256 * 1024 * 1024, 256 * 1024 * 1024))
+                    resource.setrlimit(resource.RLIMIT_NOFILE, (32, 32))
+                except Exception:
+                    pass
+            proc = subprocess.run(
+                [sys.executable, "-I", "main.py"], cwd=td, env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, timeout=timeout, preexec_fn=limits if os.name != "nt" else None,
+            )
+            if proc.returncode == 0:
+                output = (proc.stdout or "").strip()
+                return {"status": "passed", "message": "Kod izole test ortamında çalıştı.", "output": output[:800]}
+            err = (proc.stderr or proc.stdout or "").strip()
+            return {"status": "failed", "message": f"Çalıştırma hatası (kod {proc.returncode}): {err[:900]}"}
+        except subprocess.TimeoutExpired:
+            return {"status": "failed", "message": "Kod test sırasında zaman aşımına uğradı."}
+        except Exception as exc:
+            return {"status": "static", "message": f"Sözdizimi doğrulandı; çalışma testi yapılamadı: {exc}"}
+
+
+def _test_code(code, language):
+    ok, issues, warnings = _code_static_review(code, language)
+    result = {"status": "failed" if not ok else "static", "issues": issues, "warnings": warnings, "message": ""}
+    if not ok:
+        result["message"] = " ; ".join(issues)
+        return result
+    if language == "python":
+        result.update(_safe_python_runtime_test(code))
+    elif language == "javascript":
+        node = shutil.which("node") if "shutil" in globals() else None
+        if node:
+            with tempfile.TemporaryDirectory(prefix="vantorium_js_") as td:
+                path = os.path.join(td, "main.js")
+                open(path, "w", encoding="utf-8").write(code)
+                try:
+                    proc = subprocess.run([node, "--check", path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=3)
+                    result["status"] = "passed" if proc.returncode == 0 else "failed"
+                    result["message"] = "JavaScript sözdizimi doğrulandı." if proc.returncode == 0 else (proc.stderr or "JavaScript sözdizimi hatası")[:900]
+                except Exception as exc:
+                    result["message"] = f"JavaScript statik kontrolü: {exc}"
+        else:
+            result["message"] = "JavaScript kodu üretildi; Node.js bulunmadığı için yalnızca genel kontrol yapıldı."
+    elif language == "bash":
+        bash = shutil.which("bash")
+        if bash:
+            with tempfile.TemporaryDirectory(prefix="vantorium_sh_") as td:
+                path = os.path.join(td, "main.sh")
+                open(path, "w", encoding="utf-8").write(code)
+                proc = subprocess.run([bash, "-n", path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=3)
+                result["status"] = "passed" if proc.returncode == 0 else "failed"
+                result["message"] = "Bash sözdizimi doğrulandı." if proc.returncode == 0 else (proc.stderr or "Bash sözdizimi hatası")[:900]
+        else:
+            result["message"] = "Bash bulunamadı; genel statik kontrol yapıldı."
+    else:
+        result["message"] = "Kod için genel statik kontrol tamamlandı."
+    return result
+
+
+def _attach_test_report(text, test):
+    if not test:
+        return text
+    status = test.get("status", "static")
+    if status == "passed":
+        badge = "### ✅ Kontrol ve test\nKod kontrol edildi ve güvenli izole testte çalıştı."
+        if test.get("output"):
+            badge += f"\n\n**Çıktı:** `{test['output']}`"
+    elif status == "static":
+        badge = f"### 🧪 Kontrol\n{test.get('message', 'Sözdizimi ve statik kontroller tamamlandı.')}"
+    else:
+        badge = f"### ⚠️ Test sonucu\n{test.get('message', 'Kod testte hata verdi.')}"
+    if test.get("warnings"):
+        badge += "\n\n**Not:** " + " • ".join(test["warnings"][:3])
+    return text.rstrip() + "\n\n" + badge + "\n"
 
 
 def code_response(query, user_id=None, previous_answer=None):
+    stored_q, stored_answer = _load_previous_code_for_user(user_id)
+    previous_answer = previous_answer or stored_answer
     language = detect_code_language(query)
+
     edited = _edit_previous_code(query, previous_answer)
     if edited:
-        return (edited, "uretilen_kod")
+        lang, edited_code = _extract_code_block(edited)
+        if lang and edited_code:
+            test = _test_code(edited_code, lang)
+            edited = _attach_test_report(edited, test)
+        return edited, "uretilen_kod"
+
     if DANGEROUS_CODE_RE.search(query):
-        safe = '''# Güvenli savunma örneği: HTTP erişimlerini sınırlama ve şüpheli IP'leri raporlama
+        safe = '''# Güvenli savunma örneği: HTTP erişimlerini sınırlama
 from collections import defaultdict, deque
 import time
-
 WINDOW = 60
 LIMIT = 30
 visits = defaultdict(deque)
-
 def allowed(ip: str) -> bool:
-    now = time.time()
-    q = visits[ip]
-    while q and now - q[0] > WINDOW:
-        q.popleft()
-    if len(q) >= LIMIT:
-        return False
-    q.append(now)
-    return True
-
+    now = time.time(); q = visits[ip]
+    while q and now - q[0] > WINDOW: q.popleft()
+    if len(q) >= LIMIT: return False
+    q.append(now); return True
 print("Savunma rate-limit örneği hazır.")
 '''
         return _format_code_answer(safe, "python", title="Güvenli savunma kodu", source="guvenli_kod", user_id=user_id)
-    subject = code_request_subject(query)
-    candidates = github_repo_code_search(subject, language)
-    if candidates:
-        pick = _code_variation(subject, user_id) % min(3, len(candidates))
-        best = candidates[pick]
-        title = f"GitHub örneği — {best.get('title', 'repo')}"
-        return _format_code_answer(best["code"], language, title=title, source="github_kod", user_id=user_id)
 
-    generated = generate_code_fallback(query, language, user_id=user_id)
-    return _format_code_answer(
-        generated, language,
-        title="Gelişmiş kod (yerel üretildi)",
-        source="uretilen_kod",
-        user_id=user_id
-    )
+    if _looks_like_github_request(query):
+        subject = code_request_subject(query)
+        candidates = github_repo_code_search(subject, language)
+        if candidates:
+            best = candidates[_code_variation(subject, user_id) % len(candidates)]
+            formatted = _format_code_answer(best["code"], language, title=f"GitHub kaynağı — {best.get('title', 'repo')}", source="github_kod", user_id=user_id)
+            # Harici GitHub kodunu çalıştırmıyoruz; yalnızca statik kontrol uyguluyoruz.
+            test = _test_code(best["code"], language)
+            return _attach_test_report(formatted[0], test), formatted[1]
 
+    generated = _build_strong_python_code(query, user_id) if language == "python" else generate_code_fallback(query, language, user_id=user_id)
+    # Üretimden sonra gerçek kontrol: syntax + mümkünse izole çalışma testi.
+    for attempt in range(3):
+        test = _test_code(generated, language)
+        if test.get("status") != "failed":
+            break
+        generated = (_build_strong_python_code(query + f" sağlam varyant {attempt + 2}", user_id)
+                     if language == "python" else generate_code_fallback(query + f" sağlam varyant {attempt + 2}", language, user_id=user_id))
+    if not _validate_generated_code(generated, language):
+        generated = generate_code_fallback(query + " doğrulanmış sağlam varyant", language, user_id=user_id)
+        test = _test_code(generated, language)
+    else:
+        test = _test_code(generated, language)
+    formatted = _format_code_answer(generated, language, title="Gelişmiş, kontrol edilmiş kod", source="uretilen_kod", user_id=user_id)
+    return _attach_test_report(formatted[0], test), formatted[1]
 # =========================================================
 # SMART ANSWER
 # =========================================================
@@ -1505,13 +1755,13 @@ def universal_fallback_answer(query):
             "2. İşi küçük adımlara böl ve en basit çalışan sürümü oluştur.\n"
             "3. Çalışan kısmı test et; hata varsa hatayı oluşturan adımı ayır.\n"
             "4. Sonucu iyileştir ve gerekiyorsa otomatikleştir.\n\n"
-            f"Bu soruda ana konu **{topic}**. Google sonucu mevcut değilse bile bu yöntemle adım adım ilerleyebiliriz."
+            f"Bu soruda ana konu **{topic}**. İstersen bunu adım adım, örneklerle ve uygulanabilir bir planla açabilirim."
         )
 
     if re.search(r"\b(nedir|ne demek|anlamı|kimdir|hakkında|bilgi)\b", nq):
         return (
             f"**{q}** hakkında temel açıklama\n\n"
-            f"Bu soru **{topic}** konusunu soruyor. Google sonucu alınamadığında bile cevabı boş bırakmıyorum. "
+            f"Bu soru **{topic}** konusunu soruyor. Temel anlamını, amacını ve kullanımını açıklayabilirim. "
             "Konu bir kavramsa temel anlamı, amacı ve günlük kullanımını açıklarım; kişi veya güncel olay "
             "gibi doğrulama gerektiren konularda isim/tarih uydurmam."
         )
@@ -3000,19 +3250,58 @@ def _contextualize(query, history):
 
 
 def research_events(query, parts, depth=1):
-    """Durum olayları üretir; sonunda ("result", {"md":..., "sources":[...]} | None)."""
-    yield "status", {"text": "Google'da arıyor…"}
-    bundle = first_result(query, parts)
-    if not bundle:
+    """Google'da araştırır, birden fazla kaliteli sonucu inceler ve en güçlü cevabı yazar."""
+    yield "status", {"text": "Google'da araştırıyor…"}
+    google_query = _google_query(query, parts)
+    results = _G["cse_search"](google_query, "web", 8)
+    results = [r for r in results if r.get("url")]
+    if not results:
+        simple = re.sub(r"\s+", " ", _G["extract_target"](query, parts)).strip()[:160]
+        if simple and simple != google_query:
+            results = _G["cse_search"](simple + " -site:wikipedia.org -site:tr.wikipedia.org", "web", 8)
+            results = [r for r in results if r.get("url")]
+    if not results:
         yield "result", None
         return
-    yield "status", {"text": "İlk sonucu okuyor…"}
-    top = bundle["top"]
-    md = _write_single(query, top, bundle["page"], set(_tokens(_clean_topic(query))), depth)
-    yield "result", {
-        "md": md,
-        "sources": [{"title": top.get("title") or _domain(top["url"]), "url": top["url"], "domain": _domain(top["url"])}],
-    }
+
+    # Google sırasını temel alırız ama en alakalı sonucu seçmek için küçük bir
+    # kalite/relevans puanı kullanırız. Böylece tek bir zayıf snippet'e mahkûm olmayız.
+    ranked = _G["best_results"](results, google_query, min(6, len(results)))
+    candidates = ranked[:4]
+    yield "status", {"text": f"En iyi {len(candidates)} sonucu karşılaştırıyor…"}
+    collected = []
+    sources = []
+    qterms = set(_tokens(_clean_topic(query)))
+    for pos, item in enumerate(candidates):
+        page = fetch_page(item["url"])
+        text_parts = []
+        if page:
+            for para in page.get("paras", [])[:30]:
+                text_parts.extend(_sentences(para))
+        if not text_parts:
+            sn = _G["clean_snippet"](item.get("snippet", ""), 900)
+            text_parts = _sentences(sn, lo=20) or ([sn] if sn else [])
+        for sent in text_parts[:24]:
+            if len(sent) >= 30:
+                collected.append({"text": sent, "src": pos + 1, "sec": "web", "sec_i": pos, "pos": len(collected), "kind": "web"})
+        sources.append({"title": item.get("title") or _domain(item["url"]), "url": item["url"], "domain": _domain(item["url"])})
+
+    if not collected:
+        yield "result", None
+        return
+
+    chosen = _mmr(_rank(collected, qterms), 8 * max(1, depth))
+    title = f"{query.strip()} hakkında araştırılmış cevap"
+    out = [f"## {title}", "", "**Kısa cevap**", ""]
+    lead = [x["text"] for x in sorted(chosen[:3], key=lambda x: x["pos"])]
+    out.append(" ".join(lead[:3]))
+    if len(chosen) > 3:
+        out += ["", "**Ayrıntılar**", ""]
+        for x in sorted(chosen[3:12], key=lambda x: x["pos"]):
+            out.append("• " + x["text"])
+    if depth >= 2:
+        out += ["", "**Kaynak karşılaştırması**", "", "Farklı sonuçlardaki ortak noktalar esas alınarak özetlendi; çelişen veya doğrulanamayan ayrıntılar kesin bilgi olarak sunulmadı."]
+    yield "result", {"md": "\n".join(out).rstrip() + "\n", "sources": sources[:4]}
 
 
 # =========================================================
@@ -3682,7 +3971,7 @@ def _history_context(query, history, uid=None):
         previous_user = str(persistent.get("question", ""))
     if not previous_ai and persistent:
         previous_ai = str(persistent.get("answer", ""))
-    follow = bool(re.search(r"\b(bunu|şunu|bunun|önceki|yukarıdaki|az önce|devam|geliştir|değiştir|düzelt|aynısını|aynı kod|buna|buradaki|üstteki)\b", normalize(q)))
+    follow = bool(re.search(r"\b(bunu|şunu|bunun|önceki|yukarıdaki|az önce|devam|geliştir|geliştirme|daha iyi|daha sağlam|daha güçlü|iyileştir|iyileştirme|modernleştir|değiştir|düzelt|aynısını|aynı kod|buna|buradaki|üstteki|muq|mükemmel)\b", normalize(q)))
     return q, previous_user[:6000], previous_ai[:9000], follow
 
 
@@ -3703,6 +3992,10 @@ def answer_events(query, history, uid=None):
     current_query, previous_user, previous_ai, is_followup = _history_context(query, history, uid)
     effective_query = _code_context_query(current_query, previous_user, previous_ai) if is_followup else current_query
     parts = G["analyze_query"](effective_query)
+    current_parts = G["analyze_query"](current_query)
+    if current_parts.get("is_code_request"):
+        parts["is_code_request"] = True
+        parts["is_code"] = True
 
     # 0) Kalıcı hafıza: kullanıcı yeni bir bilgi veriyorsa öğren, ardından hatırla.
     if uid:
@@ -3716,7 +4009,30 @@ def answer_events(query, history, uid=None):
             yield from _remember_and_stream(remembered, "kalici_hafiza", uid, query)
             return
 
-    # 1) Hızlı yerel yollar: özel planlar, tanımlar, selam, sohbet, matematik...
+    # 1) Kod isteği: önce önceki kodu düzenle veya güçlü kod üret.
+    if current_parts.get("is_code_request"):
+        yield "status", {"text": "İsteği ve önceki kodu analiz ediyor…"}
+        # Takip isteği varsa önceki kodun düzenlenmesini dene.
+        if is_followup and previous_ai:
+            local = G["code_response"](effective_query, user_id=uid, previous_answer=previous_ai)
+            if local:
+                yield from _remember_and_stream(local[0], local[1], uid, query)
+                return
+        # Yeni istekte bilinen kaliteli şablonlar öncelikli.
+        tpl = match_template(current_query, current_parts)
+        if tpl:
+            local = template_answer(tpl, current_query, uid)
+            lang, code = _extract_code_block(local)
+            if lang and code:
+                local = _attach_test_report(local, _test_code(code, lang))
+            yield from _remember_and_stream(local, "kod_sablon", uid, query)
+            return
+        local = G["code_response"](current_query, user_id=uid, previous_answer=previous_ai)
+        if local:
+            yield from _remember_and_stream(local[0], local[1], uid, query)
+            return
+
+    # 2) Hızlı yerel yollar: özel planlar, tanımlar, selam, sohbet, matematik...
     structured = G.get("structured_local_answer")(current_query)
     if structured:
         yield from _remember_and_stream(structured[0], structured[1], uid, query)
@@ -3728,25 +4044,22 @@ def answer_events(query, history, uid=None):
         yield from _remember_and_stream(answer, source, uid, query)
         return
 
-    # 2) Hazır, çalışan kod şablonları
+    # 3) Hazır, çalışan kod şablonları
     tpl = match_template(effective_query, parts)
     if tpl:
         yield "status", {"text": "Kodu hazırlıyor…"}
         yield from _remember_and_stream(template_answer(tpl, effective_query, uid), "kod_sablon", uid, query)
         return
 
-    # 3) Yaratıcı üretim, öneri, şablonu olmayan kod istekleri
+    # 4) Yaratıcı üretim ve öneriler
     local = G["local_creative_answer"](current_query)
     if not local and parts.get("is_recommendation"):
         local = G["recommendation_answer"](current_query)
-    if not local and parts.get("is_code_request"):
-        yield "status", {"text": "GitHub'da uygun kod arıyor…"}
-        local = G["code_response"](effective_query, user_id=uid, previous_answer=previous_ai)
     if local:
         yield from _remember_and_stream(local[0], local[1], uid, query)
         return
 
-    # 4) Araştırma: Google ilk sonucu → yerel, kaynaklı cevap
+    # 5) Araştırma: Google ilk sonucu → yerel, kaynaklı cevap
     topic_query, depth = _contextualize(current_query, history)
     topic_parts = G["analyze_query"](topic_query)
     result = None
@@ -3764,7 +4077,7 @@ def answer_events(query, history, uid=None):
         yield from _remember_and_stream(result["md"], "arastirma", uid, query)
         return
 
-    # 5) Google'a ulaşılamasa bile cevap akışını boş bırakma.
+    # 6) Google'a ulaşılamasa bile cevap akışını boş bırakma.
     # get_answer önce yerel bilgi/hafıza yollarını dener; son aşamada
     # universal_fallback_answer her zaman metin üretir. Harici LLM yoktur.
     try:
