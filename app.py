@@ -1625,6 +1625,30 @@ def local_knowledge_answer(query):
             return answer
     return None
 
+def detect_response_language(query):
+    q=normalize(query or "")
+    if re.search(r"[а-яё]", q): return "ru"
+    if re.search(r"[ء-ي]", q): return "ar"
+    scores={
+        "en": sum(bool(re.search(r"\b"+x+r"\b",q)) for x in ("what","who","how","why","where","when","can","please","help","is","are")),
+        "de": sum(bool(re.search(r"\b"+x+r"\b",q)) for x in ("was","wer","wie","warum","wo","wann","bitte","hilfe","ist","sind")),
+        "fr": sum(bool(re.search(r"\b"+x+r"\b",q)) for x in ("quoi","qui","comment","pourquoi","où","quand","merci","aide","est","sont")),
+        "es": sum(bool(re.search(r"\b"+x+r"\b",q)) for x in ("qué","quién","cómo","por","dónde","cuándo","gracias","ayuda","es","son")),
+        "tr": sum(bool(re.search(r"\b"+x+r"\b",q)) for x in ("ne","kim","nasıl","neden","nerede","teşekkür","yardım","nedir","mı","mi")),
+    }
+    lang=max(scores,key=scores.get)
+    return lang if scores[lang] else "tr"
+
+
+def smart_local_reasoning(query):
+    q=normalize(query or "")
+    if re.search(r"\b(artı|eksi|avantaj|dezavantaj|fayda|zarar)\b",q):
+        return (f"**{query.strip()}** için hızlı değerlendirme\n\n**Artıları:** hız, kolaylık, otomasyon ve ölçeklenebilirlik sağlayabilir.\n\n**Eksileri:** maliyet, bakım, güvenlik ve öğrenme süresi oluşturabilir.\n\nNet seçim için amaç, bütçe ve teknik gereksinimleri birlikte değerlendirmek gerekir."), "yerel_akil"
+    if re.search(r"\b(adım adım|aşama aşama|nasıl yapılır|nasıl yaparım)\b",q):
+        return (f"**{query.strip()}** için adım adım yaklaşım\n\n1. Hedefi netleştir.\n2. Gerekli girdileri ve araçları belirle.\n3. En küçük çalışan sürümü oluştur.\n4. Her adımı ayrı test et.\n5. Hataları loglardan ayırıp düzelt.\n6. Güvenlik, performans ve kullanıcı deneyimini iyileştir."), "yerel_akil"
+    return None
+
+
 def universal_fallback_answer(query):
     """Harici LLM kullanmadan hiçbir soruyu boş bırakmayan son cevap katmanı.
 
@@ -1639,6 +1663,13 @@ def universal_fallback_answer(query):
     nq = normalize(q)
     words = [w for w in re.findall(r"[a-zçğıöşü0-9]+", nq) if len(w) >= 3]
     topic = " ".join(words[:8]) or q
+    lang = detect_response_language(q)
+
+    if lang == "en":
+        if re.search(r"\b(how|steps|make|create|build)\b", nq):
+            return f"**{q}** — a practical approach:\n\n1. Define the goal.\n2. Break it into small steps.\n3. Build the smallest working version.\n4. Test each part and fix errors.\n5. Improve security, performance and usability.\n\nI won’t invent current facts without a reliable source."
+        if re.search(r"\b(what|who|why|where|when)\b", nq):
+            return f"**{q}**\n\nI can answer from local knowledge or research it on Google when the topic requires current or verifiable information. I won’t make up uncertain facts."
 
     if re.search(r"\b(nasıl|yapılır|yapabilirim|kurulur|oluşturulur|başlayayım)\b", nq):
         return (
@@ -1738,12 +1769,141 @@ def smalltalk_answer(query):
     ])
 
 
-def get_answer(query):
+
+def contextual_reasoning_answer(query, user_id=None):
+    """Harici LLM kullanmadan son konuşmayı anlayan takip-sorusu katmanı."""
+    if not user_id:
+        return None
+
+    q = normalize(query)
+    previous = get_persistent_context(user_id)
+    memory_answer = personal_memory_answer(user_id, query)
+    if memory_answer:
+        return memory_answer, "hafiza"
+
+    if not previous:
+        return None
+
+    previous_question = str(previous.get("question") or "").strip()
+    previous_answer = str(previous.get("answer") or "").strip()
+    if not previous_answer:
+        return None
+
+    followup = bool(re.search(
+        r"\b(bunu|şunu|onu|burayı|üsttekini|yukarıdakini|devam|"
+        r"geliştir|iyileştir|düzelt|değiştir|kısalt|uzat|detaylandır|"
+        r"daha detaylı|biraz daha|başka|peki|sonra ne|nasıl devam)\b",
+        q, re.I
+    ))
+
+    if not followup:
+        return None
+
+    # Son cevap kod içeriyorsa, "bunu geliştir/düzelt" isteğini doğrudan kod
+    # motoruna yönlendir. Kod güvenli doğrulama katmanından geçer.
+    if "```" in previous_answer or re.search(r"\b(def |import |const |function |class |<html|SELECT )", previous_answer):
+        try:
+            edited = code_response(query, user_id=user_id, previous_answer=previous_answer)
+            return edited
+        except Exception:
+            pass
+
+    if re.search(r"\b(geliştir|iyileştir|daha detaylı|detaylandır|uzat)\b", q):
+        return (
+            f"Önceki konumuz **{previous_question[:180]}** idi.\n\n"
+            f"Mevcut cevabı daha uygulanabilir hâle getirirsek:\n\n"
+            "1. Ana hedefi netleştir.\n"
+            "2. Gereksiz adımları çıkar.\n"
+            "3. Eksik teknik ayrıntıları ekle.\n"
+            "4. Hata ve kenar durumlarını kontrol et.\n"
+            "5. Sonucu küçük bir testle doğrula.\n\n"
+            "İstersen aynı konuyu daha teknik, daha kısa veya doğrudan uygulanabilir biçimde sürdürebilirim.",
+            "baglam"
+        )
+
+    if re.search(r"\b(düzelt|değiştir)\b", q):
+        return (
+            f"Önceki isteğini (**{previous_question[:180]}**) bağlam olarak aldım.\n\n"
+            "Neyi değiştirmek istediğini mevcut cevabın üzerinden ele alabilirim. "
+            "Kodsa önceki sürümü koruyup yalnızca gerekli bölümleri değiştiririm; "
+            "normal bir metinse anlamı koruyarak düzenlerim.",
+            "baglam"
+        )
+
+    return (
+        f"Önceki mesajını bağlam olarak aldım: **{previous_question[:180]}**.\n\n"
+        f"Devam edelim. Önceki cevabın temel noktası: {previous_answer[:700]}",
+        "baglam"
+    )
+
+
+def enhanced_local_reasoning(query):
+    """Yerel karar motoru: açıklama, karşılaştırma, plan, hata ayıklama ve özetleme."""
+    q = normalize(query)
+    if not q:
+        return None
+
+    if re.search(r"\b(özetle|kısaca özet|özet çıkar)\b", q):
+        return (
+            f"**Kısa özet:** {query.strip()}\n\n"
+            "Ana fikri ayır, gereksiz ayrıntıları çıkar, önemli kararları ve sonraki adımı öne al.",
+            "yerel_akil"
+        )
+
+    if re.search(r"\b(debug|hata ayıkla|hata alıyorum|çalışmıyor|çalışmıyor neden|bug var)\b", q):
+        return (
+            "**Hata ayıklama yaklaşımı**\n\n"
+            "1. Hata mesajını ve oluştuğu satırı ayır.\n"
+            "2. Girdileri ve beklenen sonucu karşılaştır.\n"
+            "3. Sorunu oluşturan en küçük parçayı izole et.\n"
+            "4. Düzeltmeyi uygula ve aynı senaryoyu tekrar test et.\n"
+            "5. Ardından kenar durumları ve performansı kontrol et.",
+            "yerel_akil"
+        )
+
+    if re.search(r"\b(karşılaştır|kıyasla|farkı ne|hangisi daha iyi|mı yoksa)\b", q):
+        return (
+            "**Karşılaştırma çerçevesi**\n\n"
+            "• Kullanım amacı\n• Performans\n• Öğrenme/kurulum kolaylığı\n"
+            "• Maliyet\n• Güvenlik\n• Ekosistem ve bakım\n\n"
+            "İki seçeneği yazarsan bu ölçütlerle doğrudan tablo şeklinde kıyaslayabilirim.",
+            "yerel_akil"
+        )
+
+    if re.search(r"\b(plan yap|yol haritası|roadmap|proje planı)\b", q):
+        return (
+            "**Uygulanabilir yol haritası**\n\n"
+            "1. Hedef ve kapsam\n"
+            "2. Minimum çalışan sürüm\n"
+            "3. Veri ve iş mantığı\n"
+            "4. Arayüz ve kullanıcı akışı\n"
+            "5. Test ve hata düzeltme\n"
+            "6. Güvenlik ve performans\n"
+            "7. Yayına alma ve izleme",
+            "yerel_akil"
+        )
+
+    return None
+
+def get_answer(query, user_id=None):
     query = (query or "").strip()
     if not query:
         return "Bir şeyler yaz, birlikte bakalım.", "sistem"
 
     parts = analyze_query(query)
+
+    # Kalıcı kullanıcı hafızası ve takip soruları önce değerlendirilir.
+    contextual = contextual_reasoning_answer(query, user_id=user_id)
+    if contextual:
+        return contextual
+
+    smart = smart_local_reasoning(query)
+    if smart:
+        return smart
+
+    enhanced = enhanced_local_reasoning(query)
+    if enhanced:
+        return enhanced
 
     structured = structured_local_answer(query)
     if structured:
@@ -1872,10 +2032,90 @@ a{color:inherit;text-decoration:none}button,input,textarea{font:inherit}.navbar{
 .logo{display:flex;align-items:center;gap:11px;font-weight:850;font-size:18px;letter-spacing:-.6px}.logo-icon{width:38px;height:38px;border-radius:13px;object-fit:contain;box-shadow:0 8px 24px rgba(0,0,0,.2)}.nav-actions{display:flex;gap:4px;align-items:center}.btn-nav{padding:9px 13px;color:var(--muted);border-radius:11px;font-size:13px;font-weight:700;transition:.2s}.btn-nav:hover{color:var(--text);background:var(--surface3)}.btn-nav.primary{background:var(--accent);color:#03130e;box-shadow:0 8px 28px rgba(25,217,160,.18)}
 .container{width:min(430px,calc(100% - 28px));margin:auto;padding:32px;background:linear-gradient(180deg,color-mix(in srgb,var(--surface2) 96%,transparent),var(--surface));border:1px solid var(--line);border-radius:24px;box-shadow:var(--shadow)}.container.wide{width:min(1120px,calc(100% - 28px));margin:38px auto}.auth-wrapper{min-height:calc(100vh - 70px);display:grid;place-items:center;padding:30px 0}h1.page-title{font-size:34px;letter-spacing:-1.3px;margin-bottom:8px}h2{font-size:25px;letter-spacing:-.6px;margin-bottom:7px}.subtitle{color:var(--muted);line-height:1.65;font-size:14px;margin-bottom:24px}label{display:block;color:color-mix(in srgb,var(--text) 82%,var(--muted));font-size:13px;font-weight:700;margin-bottom:7px}input[type=text],input[type=password]{width:100%;padding:13px 14px;margin-bottom:17px;border:1px solid var(--line2);border-radius:13px;background:var(--surface);color:var(--text);outline:none;transition:.2s}input:focus{border-color:rgba(25,217,160,.7);box-shadow:0 0 0 4px rgba(25,217,160,.09)}.btn{width:100%;padding:13px 15px;border:0;border-radius:13px;background:linear-gradient(135deg,var(--accent),var(--accent2));color:#03130e;font-weight:850;cursor:pointer;transition:.2s;box-shadow:0 10px 28px rgba(25,217,160,.12)}.btn:hover{transform:translateY(-1px);filter:brightness(1.05)}.btn:active{transform:translateY(0)}.btn-small{width:auto;padding:10px 15px;font-size:13px}.btn.danger{background:#ef4c61;color:#fff}.btn.secondary{background:var(--surface3);color:var(--text);box-shadow:none}.link-row{text-align:center;margin-top:21px;color:var(--muted);font-size:14px}.link-row a{color:var(--accent)}.error{padding:12px;border-radius:13px;background:rgba(255,92,112,.09);border:1px solid rgba(255,92,112,.2);color:#ff8b99;margin-bottom:18px;font-size:13px}.card{padding:25px;margin-bottom:18px;background:linear-gradient(180deg,var(--surface2),var(--surface));border:1px solid var(--line);border-radius:20px;box-shadow:0 12px 40px rgba(0,0,0,.08)}.card h3{display:flex;gap:9px;align-items:center;margin-bottom:14px;font-size:16px}.card p{color:var(--muted);line-height:1.75;font-size:14px;margin-bottom:12px}.code-block,.api-key-box{background:#06090d;border:1px solid var(--line);border-radius:13px;padding:15px;overflow:auto;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;line-height:1.7}.api-key-box{color:var(--accent);word-break:break-all}.section-title{margin:34px 0 14px;font-size:18px}.card ul{list-style:none}.card li{padding:11px 0;border-bottom:1px solid var(--line);color:var(--muted);line-height:1.6;font-size:14px}.card li:last-child{border-bottom:0}.card li:before{content:"✓";color:var(--accent);margin-right:9px;font-weight:800}.footer{color:#687383;text-align:center;padding:35px 15px;font-size:12px}
 .search-page{width:min(1100px,calc(100% - 28px));margin:42px auto}.search-hero{text-align:center;margin-bottom:30px}.search-hero h1{font-size:46px;letter-spacing:-2px;margin-bottom:10px}.search-hero p{color:var(--muted)}.search-box{position:relative;max-width:850px;margin:25px auto}.search-box input{margin:0;padding:18px 110px 18px 20px;border-radius:18px;background:var(--surface2);box-shadow:0 18px 55px rgba(0,0,0,.18)}.search-box button{position:absolute;right:7px;top:7px;height:46px;padding:0 19px;border:0;border-radius:13px;background:var(--accent);color:#03130e;font-weight:850;cursor:pointer}.result{padding:20px;border:1px solid var(--line);border-radius:17px;background:var(--surface);margin-bottom:12px;transition:.2s}.result:hover{transform:translateY(-1px);border-color:var(--line2)}.result h3{color:var(--text);font-size:15px;margin-bottom:6px}.result .source{color:var(--accent);font-size:11px;font-weight:850;text-transform:uppercase;margin-bottom:7px}.result p{color:var(--muted);font-size:13px;line-height:1.65}.result a{display:inline-block;margin-top:9px;color:#65dfba;font-size:12px;word-break:break-all}.image-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:13px}.image-card{overflow:hidden;border-radius:16px;border:1px solid var(--line);background:var(--surface)}.image-card img{width:100%;height:155px;display:block;object-fit:cover}.image-card div{padding:10px;font-size:11px;color:var(--muted)}.thinking{display:flex;align-items:center;gap:9px;color:var(--text);font-weight:700}.thinking-dot{width:8px;height:8px;border-radius:50%;background:#9bbcf2;box-shadow:0 0 0 5px rgba(155,188,242,.12);animation:vPulse 1s infinite}@keyframes vPulse{50%{opacity:.35;transform:scale(.8)}}
-.dashboard-shell{width:min(1160px,calc(100% - 28px));margin:34px auto 70px}.dashboard-head{display:flex;align-items:flex-end;justify-content:space-between;gap:20px;margin-bottom:24px}.dashboard-head h1{font-size:38px;letter-spacing:-1.5px}.eyebrow{font-size:11px;font-weight:850;letter-spacing:1.5px;color:var(--accent);margin-bottom:8px}.status-pill{display:flex;align-items:center;gap:8px;padding:9px 12px;border:1px solid var(--line);background:var(--surface);border-radius:999px;color:var(--muted);font-size:12px;font-weight:750}.dot{width:7px;height:7px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 5px rgba(25,217,160,.1)}.dashboard-stage{display:grid;grid-template-columns:minmax(0,1fr) 230px;gap:16px}.api-panel,.api-create-rail,.setting-option{background:linear-gradient(180deg,var(--surface2),var(--surface));border:1px solid var(--line);border-radius:22px;box-shadow:0 14px 45px rgba(0,0,0,.1)}.api-panel{padding:24px}.api-list{display:grid;gap:10px}.api-row{display:flex;justify-content:space-between;align-items:center;gap:15px;padding:16px;border:1px solid var(--line);border-radius:16px;background:color-mix(in srgb,var(--surface3) 55%,transparent)}.api-name{font-weight:800}.api-meta{color:var(--muted);font-size:11px;margin-top:5px}.api-create-rail{padding:16px;height:max-content;position:sticky;top:90px}.api-create-btn{width:100%;border:0;border-radius:15px;padding:14px;background:var(--accent);color:#03130e;font-weight:850;cursor:pointer;box-shadow:0 12px 30px rgba(25,217,160,.16);transition:.2s}.api-create-btn:hover{transform:translateY(-2px)}.empty-api{padding:36px 20px;text-align:center;color:var(--muted);border:1px dashed var(--line2);border-radius:16px}.empty-api strong{color:var(--text)}.settings-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.setting-option{padding:20px}.modal-backdrop{position:fixed;inset:0;z-index:1000;display:none;place-items:center;padding:18px;background:rgba(0,0,0,.68);backdrop-filter:blur(16px)}.modal-backdrop.open{display:grid}.modal-card{width:min(520px,100%);padding:25px;border:1px solid var(--line2);border-radius:24px;background:var(--surface2);box-shadow:0 30px 100px rgba(0,0,0,.55)}.modal-actions{display:flex;justify-content:flex-end;gap:9px;margin-top:18px}.modal-actions .btn-small{min-width:90px}.hint{color:var(--muted);font-size:13px;line-height:1.6;margin-bottom:18px}.success-key{margin-top:15px;padding:15px;border-radius:15px;background:rgba(25,217,160,.08);border:1px solid rgba(25,217,160,.18)}.success-key code{display:block;margin-top:10px;padding:12px;border-radius:10px;background:#05080c;color:var(--accent);word-break:break-all;font-size:12px}
+.dashboard-shell{width:min(1160px,calc(100% - 28px));margin:34px auto 70px}.dashboard-head{display:flex;align-items:flex-end;justify-content:space-between;gap:20px;margin-bottom:24px}.dashboard-head h1{font-size:38px;letter-spacing:-1.5px}.eyebrow{font-size:11px;font-weight:850;letter-spacing:1.5px;color:var(--accent);margin-bottom:8px}.status-pill{display:flex;align-items:center;gap:8px;padding:9px 12px;border:1px solid var(--line);background:var(--surface);border-radius:999px;color:var(--muted);font-size:12px;font-weight:750}.dot{width:7px;height:7px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 5px rgba(25,217,160,.1)}.dashboard-stage{display:grid;grid-template-columns:minmax(0,1fr) 230px;gap:16px}.api-panel,.api-create-rail,.setting-option{background:linear-gradient(180deg,var(--surface2),var(--surface));border:1px solid var(--line);border-radius:22px;box-shadow:0 14px 45px rgba(0,0,0,.1)}.api-panel{padding:24px}.api-list{display:grid;gap:10px}.api-row{display:flex;justify-content:space-between;align-items:center;gap:15px;padding:16px;border:1px solid var(--line);border-radius:16px;background:color-mix(in srgb,var(--surface3) 55%,transparent)}.api-name{font-weight:800}.api-meta{color:var(--muted);font-size:11px;margin-top:5px}.api-create-rail{padding:16px;height:max-content;position:sticky;top:90px}.api-create-btn{width:100%;border:0;border-radius:15px;padding:14px;background:var(--accent);color:#03130e;font-weight:850;cursor:pointer;box-shadow:0 12px 30px rgba(25,217,160,.16);transition:.2s}.api-create-btn:hover{transform:translateY(-2px)}.api-create-details{position:relative}.api-create-details>summary{list-style:none;width:100%;border:0;border-radius:15px;padding:14px;background:var(--accent);color:#03130e;font-weight:850;cursor:pointer;box-shadow:0 12px 30px rgba(25,217,160,.16);transition:.2s;text-align:center}.api-create-details>summary::-webkit-details-marker{display:none}.api-create-details>summary:hover{transform:translateY(-2px)}.key-fallback-backdrop{position:fixed;inset:0;z-index:1100;display:grid;place-items:center;padding:18px;background:rgba(0,0,0,.68);backdrop-filter:blur(16px)}.key-fallback-card{width:min(520px,100%);padding:25px;border:1px solid var(--line2);border-radius:24px;background:var(--surface2);box-shadow:0 30px 100px rgba(0,0,0,.55)}.api-create-details[open]>summary{position:relative;z-index:1200}.empty-api{padding:36px 20px;text-align:center;color:var(--muted);border:1px dashed var(--line2);border-radius:16px}.empty-api strong{color:var(--text)}.settings-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.setting-option{padding:20px}.modal-backdrop{position:fixed;inset:0;z-index:1000;display:none;place-items:center;padding:18px;background:rgba(0,0,0,.68);backdrop-filter:blur(16px)}.modal-backdrop.open{display:grid}.modal-card{width:min(520px,100%);padding:25px;border:1px solid var(--line2);border-radius:24px;background:var(--surface2);box-shadow:0 30px 100px rgba(0,0,0,.55)}.modal-actions{display:flex;justify-content:flex-end;gap:9px;margin-top:18px}.modal-actions .btn-small{min-width:90px}.hint{color:var(--muted);font-size:13px;line-height:1.6;margin-bottom:18px}.success-key{margin-top:15px;padding:15px;border-radius:15px;background:rgba(25,217,160,.08);border:1px solid rgba(25,217,160,.18)}.success-key code{display:block;margin-top:10px;padding:12px;border-radius:10px;background:#05080c;color:var(--accent);word-break:break-all;font-size:12px}
 .policy-overlay{position:fixed;inset:0;z-index:1000;display:grid;place-items:center;padding:20px;background:rgba(0,0,0,.62);backdrop-filter:blur(12px)}.policy-modal{width:min(520px,100%);max-height:min(720px,88vh);overflow:auto;padding:27px;border-radius:24px;background:var(--surface2);border:1px solid var(--line2);box-shadow:0 30px 100px rgba(0,0,0,.6)}.policy-icon{width:48px;height:48px;border-radius:15px;display:grid;place-items:center;background:rgba(25,217,160,.12);color:var(--accent);margin-bottom:14px;font-weight:900}.policy-modal h3{font-size:21px;margin-bottom:7px}.policy-modal p{color:var(--muted);font-size:13px;line-height:1.7}.policy-list{margin:17px 0;display:grid;gap:9px}.policy-item{padding:11px 12px;border-radius:12px;background:var(--surface3);color:color-mix(in srgb,var(--text) 82%,var(--muted));font-size:13px}.policy-buttons{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:18px}.policy-buttons a{padding:12px;border-radius:12px;text-align:center;background:var(--surface3);font-size:13px;font-weight:750}.policy-buttons a.primary{background:var(--accent);color:#03130e}.close-policy{display:block;text-align:center;margin-top:13px;color:var(--muted);font-size:12px;cursor:pointer}
 @media(max-width:820px){.dashboard-stage{grid-template-columns:1fr}.api-create-rail{position:static}.dashboard-head{align-items:flex-start;flex-direction:column}.settings-grid{grid-template-columns:1fr}.search-hero h1{font-size:35px}}
 @media(max-width:720px){.navbar{height:62px;padding:0 11px}.nav-actions{gap:0;overflow:auto;max-width:72vw}.btn-nav{padding:8px 7px;font-size:11px;white-space:nowrap}.logo{font-size:15px}.logo-icon{width:32px;height:32px}.search-page{margin-top:28px}.search-box input{padding-right:88px}.search-box button{padding:0 13px}.dashboard-shell{margin-top:22px}.dashboard-head h1{font-size:31px}.api-row{align-items:flex-start;flex-direction:column}.api-row>div:last-child{width:100%}.modal-card{padding:20px}}
+
+/* Vantorium calm UI v2 — flat, quiet, responsive, Inter-first */
+:root{
+  --bg:#0b0d10;--surface:#111418;--surface2:#171a1f;--surface3:#1c2026;
+  --line:#252a31;--line2:#30363e;--text:#f3f4f6;--muted:#8b929d;
+  --accent:#20c997;--accent2:#19b88a;--danger:#ef626f;
+  --shadow:0 8px 28px rgba(0,0,0,.16);--radius:14px
+}
+body{
+  background:var(--bg)!important;
+  background-image:none!important;
+  font-family:Inter,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif!important;
+}
+body.light{
+  --bg:#fbfbfa;--surface:#ffffff;--surface2:#f6f7f8;--surface3:#eef0f2;
+  --line:#e6e8eb;--line2:#d8dce1;--text:#202327;--muted:#6d737c;
+  --shadow:0 8px 24px rgba(18,24,32,.06)
+}
+.navbar,.nav,.topbar{
+  background:color-mix(in srgb,var(--bg) 94%,transparent)!important;
+  border-bottom:1px solid var(--line)!important;
+  box-shadow:none!important;
+  backdrop-filter:blur(12px);
+}
+.card,.panel,.api-panel,.setting-option,.search-hero,.search-result,.modal-card,
+.api-create-panel-inner,.dashboard-stage{
+  box-shadow:none!important;
+  border:1px solid var(--line)!important;
+  border-radius:var(--radius)!important;
+  background:var(--surface)!important;
+}
+button,.btn,.api-create-btn{
+  box-shadow:none!important;
+  transform:none!important;
+  transition:background .15s ease,border-color .15s ease,color .15s ease,opacity .15s ease!important;
+}
+button:hover,.btn:hover,.api-create-btn:hover{transform:none!important}
+input,textarea,select{
+  background:var(--surface2)!important;
+  border:1px solid var(--line)!important;
+  box-shadow:none!important;
+  border-radius:11px!important;
+}
+input:focus,textarea:focus,select:focus{
+  border-color:var(--line2)!important;
+  outline:2px solid rgba(32,201,151,.12)!important;
+  box-shadow:none!important;
+}
+.dashboard-shell{max-width:1120px!important;padding:32px 20px 60px!important}
+.dashboard-head{gap:20px!important;margin-bottom:20px!important}
+.dashboard-head h1,.page-title{letter-spacing:-.035em!important;font-weight:650!important}
+.eyebrow{letter-spacing:.09em!important;font-size:11px!important}
+.status-pill{background:var(--surface)!important;border:1px solid var(--line)!important;box-shadow:none!important}
+.dashboard-stage{display:grid!important;grid-template-columns:minmax(0,1fr) 190px!important;gap:12px!important;padding:12px!important;background:var(--surface2)!important}
+.api-panel{padding:22px!important}
+.api-create-rail{display:flex!important;align-items:flex-start!important}
+.api-create-btn{width:100%!important;min-height:44px!important;display:flex!important;align-items:center!important;justify-content:center!important;background:var(--text)!important;color:var(--bg)!important;border:1px solid var(--text)!important;border-radius:11px!important;font-weight:600!important}
+.api-create-btn:hover{opacity:.9!important}
+.api-create-panel{display:none;margin-top:12px}
+.api-create-panel[style*="display:block"]{display:block!important}
+.api-create-panel-inner{padding:22px!important;display:grid!important;grid-template-columns:minmax(0,1fr) minmax(280px,420px)!important;gap:28px!important;align-items:end!important}
+.api-create-form{display:grid!important;gap:10px!important}
+.api-create-form label{font-size:12px!important;color:var(--muted)!important}
+.api-row{background:transparent!important;border-bottom:1px solid var(--line)!important;border-radius:0!important;padding:16px 2px!important}
+.api-row:last-child{border-bottom:0!important}
+.settings-grid{gap:12px!important}
+.setting-option{padding:18px!important}
+.search-page,.container.wide{max-width:1040px!important}
+.search-hero{background:var(--surface)!important}
+@media(max-width:820px){
+  .dashboard-stage{grid-template-columns:1fr!important}
+  .api-create-rail{order:-1}
+  .api-create-btn{width:100%!important}
+  .api-create-panel-inner{grid-template-columns:1fr!important}
+}
+@media(max-width:600px){
+  .dashboard-shell{padding:20px 14px 42px!important}
+  .dashboard-head{align-items:flex-start!important;flex-direction:column!important}
+  .api-panel{padding:16px!important}
+}
 </style>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -2586,23 +2826,52 @@ def dashboard():
     if not rows: rows='<div class="empty-api"><strong>Henüz API Key yok.</strong><br><span>Sağdaki butondan ilk anahtarını oluştur.</span></div>'
     content=f"""
     <main class="dashboard-shell"><div class="dashboard-head"><div><div class="eyebrow">VANTORIUM DEVELOPER</div><h1>API Dashboard</h1><p class="subtitle">Hoş geldin, <strong>{html.escape(user['username'])}</strong>. Anahtarlarını güvenli şekilde yönet.</p></div><div class="status-pill"><span class="dot"></span> Sistem hazır</div></div>
-    <div class="dashboard-stage"><section class="api-panel"><h2>API Key'ler</h2><p class="subtitle">Anahtarların isimleri ve güvenli önekleri burada görünür. Gizli token oluşturulduğu anda bir kez gösterilir.</p><div class="api-list">{rows}</div></section><aside class="api-create-rail"><button class="api-create-btn" onclick="openKeyModal()">＋ API Key oluştur</button></aside></div>
+    <div class="dashboard-stage"><section class="api-panel"><h2>API Key'ler</h2><p class="subtitle">Anahtarların isimleri ve güvenli önekleri burada görünür. Gizli token oluşturulduğu anda bir kez gösterilir.</p><div class="api-list">{rows}</div></section><aside class="api-create-rail"><a class="api-create-btn" href="/dashboard?new_key=1">＋ API Key oluştur</a></aside></div>
+    <div class="api-create-panel"{' style="display:block"' if request.args.get("new_key") == "1" else ''}><div class="api-create-panel-inner"><div><div class="eyebrow">YENİ ANAHTAR</div><h2>API Key oluştur</h2><p class="hint">Anahtarına kolayca tanıyabileceğin bir isim ver. Token yalnızca oluşturulduğu anda tam olarak gösterilir.</p></div><form method="POST" action="/api/keys" class="api-create-form"><label for="keyNameFallback">API Key ismi</label><input id="keyNameFallback" type="text" name="name" maxlength="50" minlength="2" placeholder="Örn. Mobil Uygulama" autocomplete="off" required><div class="modal-actions"><a class="btn secondary btn-small" href="/dashboard">İptal</a><button class="btn btn-small" type="submit">Oluştur</button></div></form></div></div>
     <div class="settings-grid" style="margin-top:16px"><div class="setting-option"><strong>🔐 Güvenlik</strong><p class="subtitle" style="margin:8px 0 0">Tokenlar ekranda kalıcı olarak gösterilmez. Oluşturulduğunda tek seferlik görüntülenir.</p></div><div class="setting-option"><strong>⚡ API erişimi</strong><p class="subtitle" style="margin:8px 0 0">Anahtarlar hesabına bağlıdır ve gerektiğinde devre dışı bırakılabilir.</p></div></div></main>
-    <div id="keyModal" class="modal-backdrop" onclick="if(event.target===this)closeKeyModal()"><div class="modal-card"><h2>Yeni API Key</h2><p class="hint">Anahtarına kolayca tanıyabileceğin bir isim ver. Örneğin <b>Mobil Uygulama</b> veya <b>Web Projesi</b>.</p><label>API Key ismi</label><input id="keyName" type="text" maxlength="50" placeholder="Örn. Mobil Uygulama" autocomplete="off"><div id="keyResult"></div><div class="modal-actions"><button class="btn secondary btn-small" onclick="closeKeyModal()">İptal</button><button class="btn btn-small" id="createKeyBtn" onclick="createApiKey()">Oluştur</button></div></div></div>
-    <script>function openKeyModal(){{document.getElementById('keyModal').classList.add('open');document.getElementById('keyName').focus();document.getElementById('keyResult').innerHTML='';}}function closeKeyModal(){{document.getElementById('keyModal').classList.remove('open')}}async function createApiKey(){{const name=document.getElementById('keyName').value.trim(),btn=document.getElementById('createKeyBtn'),result=document.getElementById('keyResult');if(name.length<2){{result.innerHTML='<div class="error">API Key ismi en az 2 karakter olmalı.</div>';return;}}btn.disabled=true;btn.textContent='Oluşturuluyor…';try{{const r=await fetch('/api/keys',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{name}})}}),d=await r.json();if(!r.ok)throw new Error(d.error||'Oluşturulamadı');result.innerHTML='<div class="success-key"><strong>✓ API Key oluşturuldu</strong><div class="hint" style="margin:6px 0 0">Bu token yalnızca şimdi gösteriliyor. Güvenli yerde sakla.</div><code id="newToken">'+escapeHtml(d.token)+'</code><button class="btn btn-small" style="margin-top:12px" onclick="navigator.clipboard.writeText(document.getElementById('newToken').textContent)">Kopyala</button></div>';btn.textContent='Tamam';btn.onclick=()=>location.reload();}}catch(e){{result.innerHTML='<div class="error">'+escapeHtml(e.message)+'</div>';btn.disabled=false;btn.textContent='Oluştur';}}}}function escapeHtml(v){{const d=document.createElement('div');d.textContent=v||'';return d.innerHTML;}}</script>
     """
     return render_page("Dashboard",content,user)
 
 @app.route("/api/keys",methods=["POST"])
 @login_required
 def create_api_key():
-    user=get_current_user(); data=request.get_json(silent=True) or {}; name=str(data.get("name","")).strip()
-    if not 2<=len(name)<=50:return jsonify({"error":"API Key ismi 2-50 karakter olmalı."}),400
-    raw="vnt_"+secrets.token_urlsafe(32); digest=hashlib.sha256(raw.encode()).hexdigest()
+    user=get_current_user()
+    data=request.get_json(silent=True) if request.is_json else request.form
+    data=data or {}
+    name=str(data.get("name","")).strip()
+    if not 2<=len(name)<=50:
+        if request.is_json:
+            return jsonify({"error":"API Key ismi 2-50 karakter olmalı."}),400
+        return render_page("API Key", '<main class="container wide"><div class="error">API Key ismi 2-50 karakter olmalı.</div><a class="btn btn-small" href="/dashboard">Dashboard</a></main>', user), 400
+    raw="vnt_"+secrets.token_urlsafe(32)
+    digest=hashlib.sha256(raw.encode()).hexdigest()
     try:
-        with db_cursor() as cur: cur.execute("INSERT INTO api_keys(user_id,name,key_hash,key_prefix,created_at,is_active) VALUES(?,?,?,?,?,1)",(user["id"],name,digest,raw[:12],datetime.now().isoformat()))
-        return jsonify({"ok":True,"name":name,"token":raw,"prefix":raw[:12]})
-    except Exception as e:return jsonify({"error":"Anahtar oluşturulamadı."}),500
+        with db_cursor() as cur:
+            cur.execute("INSERT INTO api_keys(user_id,name,key_hash,key_prefix,created_at,is_active) VALUES(?,?,?,?,?,1)",(user["id"],name,digest,raw[:12],datetime.now().isoformat()))
+        if request.is_json:
+            return jsonify({"ok":True,"name":name,"token":raw,"prefix":raw[:12]})
+        safe_token = html.escape(raw)
+        safe_name = html.escape(name)
+        content=(
+            '<main class="container wide"><div class="eyebrow">VANTORIUM DEVELOPER</div>'
+            '<h1 class="page-title">API Key oluşturuldu</h1>'
+            '<p class="subtitle">Token başarıyla oluşturuldu. Bu değer yalnızca şimdi tam olarak gösteriliyor.</p>'
+            '<div class="success-key"><strong>'+safe_name+'</strong>'
+            '<code class="api-key-box" id="createdApiKey" style="display:block;margin-top:12px;word-break:break-all">'+safe_token+'</code>'
+            '<p class="hint" style="margin:12px 0 0">Tokenı şimdi kopyala ve güvenli bir yerde sakla.</p></div>'
+            '<div class="modal-actions"><a class="btn secondary btn-small" href="/dashboard">Dashboard</a>'
+            '<button class="btn btn-small" type="button" id="copyApiKeyBtn">Kopyala</button></div>'
+            '<script>(function(){const b=document.getElementById("copyApiKeyBtn"),k=document.getElementById("createdApiKey");'
+            'if(b&&k){b.addEventListener("click",async()=>{try{await navigator.clipboard.writeText(k.textContent);b.textContent="Kopyalandı ✓";}'
+            'catch(e){const r=document.createRange();r.selectNodeContents(k);const s=getSelection();s.removeAllRanges();s.addRange(r);b.textContent="Seçildi";}});}})();</script>'
+            '</main>'
+        )
+        return render_page("API Key",content,user)
+    except Exception:
+        log.exception("API key oluşturma hatası")
+        if request.is_json:
+            return jsonify({"error":"Anahtar oluşturulamadı."}),500
+        return render_page("API Key", '<main class="container wide"><div class="error">Anahtar oluşturulamadı. Tekrar dene.</div><a class="btn btn-small" href="/dashboard">Dashboard</a></main>', user), 500
 
 @app.route("/api/keys/<int:key_id>",methods=["DELETE"])
 @login_required
@@ -2715,7 +2984,7 @@ def api_word(apikey):
         return jsonify({"error": "Geçersiz API anahtarı"}), 401
 
     start = time.time()
-    answer, source = get_answer(word)
+    answer, source = get_answer(word, user_id=user["id"])
 
     return jsonify({
         "input": word,
