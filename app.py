@@ -1266,6 +1266,15 @@ def _safe_python_execution(code, timeout=2.5):
         return None, f"Çalışma testi yapılamadı: {exc}"
 
 
+def _validate_generated_code(code, language="python"):
+    """Geriye dönük uyumluluk: eski code_response çağrıları için bool doğrulama."""
+    try:
+        ok, _report = _verify_code(code, language)
+        return bool(ok)
+    except Exception:
+        return False
+
+
 def _verify_code(code, language):
     ok, detail = _static_code_check(code, language)
     if not ok:
