@@ -34,7 +34,7 @@ app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=30)
 
 # Railway / proxy arkasında doğru IP ve https algısı için (Variables: TRUST_PROXY=1)
-if os.environ.get("TRUST_PROXY", "").lower() == "1":
+if os.environ.get("TRUST_PROXY", "1" if os.environ.get("RAILWAY_ENVIRONMENT_NAME") else "0").lower() in {"1", "true", "yes", "on"}:
     from werkzeug.middleware.proxy_fix import ProxyFix
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
@@ -1725,11 +1725,16 @@ def _under_attack_gate():
             bucket.popleft()
         _GLOBAL_REQ.append(now)
         bucket.append(now)
-        # Burst limiti: normal kullanım etkilenmez, bot/flood trafiği kısa sürede kesilir.
-        if len(bucket) > (35 if request.path.startswith('/api/chat') else 60):
-            _ATTACK_BLOCKS[ip] = now + (600 if len(bucket) > 90 else 120)
-            return jsonify({"error": "Flood koruması devreye girdi. Lütfen daha sonra tekrar deneyin."}), 429
-        if len(_GLOBAL_REQ) > 180:
+        # Normal tarayıcı sayfaları birkaç ek istek yapabilir (favicon, ikon vb.).
+        # Kayıt/giriş sayfalarını tek başına flood kabul etme.
+        public_page = path in {"/", "/login", "/register", "/info", "/icon.png", "/favicon.ico", "/_human-check"}
+        burst_limit = 35 if path.startswith('/api/chat') else (120 if public_page else 75)
+        if len(bucket) > burst_limit:
+            # Çok yüksek burst'lerde geçici engelle; normal kullanıcıyı gereksiz yere kilitleme.
+            if not public_page:
+                _ATTACK_BLOCKS[ip] = now + (600 if len(bucket) > burst_limit * 2 else 120)
+            return jsonify({"error": "Flood koruması devreye girdi. Lütfen biraz sonra tekrar deneyin."}), 429
+        if len(_GLOBAL_REQ) > 500:
             return jsonify({"error": "Sunucu yoğunluğu nedeniyle istek kısa süreli sınırlandı."}), 503
 
     if not _REQUEST_SEM.acquire(blocking=False):
@@ -1747,7 +1752,19 @@ _FAIL_BUCKETS = defaultdict(deque)
 _BLOCKED_IPS = {}
 
 def client_ip():
-    # TRUST_PROXY=1 iken ProxyFix, remote_addr'ı doğru istemci IP'sine çevirir.
+    # Railway gibi reverse-proxy arkasında gerçek istemci IP'sini kullan.
+    # TRUST_PROXY etkin değilse forwarded header'a güvenme.
+    trusted = os.environ.get("TRUST_PROXY", "1" if os.environ.get("RAILWAY_ENVIRONMENT_NAME") else "0").lower() in {"1", "true", "yes", "on"}
+    if trusted:
+        forwarded = request.headers.get("X-Forwarded-For", "")
+        if forwarded:
+            first = forwarded.split(",", 1)[0].strip()
+            if first and len(first) <= 64:
+                try:
+                    ipaddress.ip_address(first)
+                    return first
+                except ValueError:
+                    pass
     return (request.remote_addr or "unknown")[:64]
 
 
@@ -1981,7 +1998,6 @@ def index():
     return redirect("/login")
 
 @app.route("/register", methods=["GET", "POST"])
-@rate_limit(5, 300)
 def register():
     if get_current_user():
         return redirect("/chat")
@@ -1989,6 +2005,11 @@ def register():
     error = None
 
     if request.method == "POST":
+        # Kayıt formunu yalnızca gerçek POST denemelerinde sınırla;
+        # sayfayı açmak rate-limit sayacını tüketmesin.
+        ip = client_ip()
+        if is_ip_blocked(ip):
+            return render_page("Kayıt", "<main class=\"auth-wrapper\"><section class=\"container\"><div class=\"error\">Çok fazla deneme yapıldı. Birkaç dakika sonra tekrar deneyin.</div><a href=\"/register\">Tekrar dene</a></section></main>", None, modal=True), 429
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
 
@@ -2055,6 +2076,11 @@ def login():
     error = None
 
     if request.method == "POST":
+        # Kayıt formunu yalnızca gerçek POST denemelerinde sınırla;
+        # sayfayı açmak rate-limit sayacını tüketmesin.
+        ip = client_ip()
+        if is_ip_blocked(ip):
+            return render_page("Kayıt", "<main class=\"auth-wrapper\"><section class=\"container\"><div class=\"error\">Çok fazla deneme yapıldı. Birkaç dakika sonra tekrar deneyin.</div><a href=\"/register\">Tekrar dene</a></section></main>", None, modal=True), 429
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
 
