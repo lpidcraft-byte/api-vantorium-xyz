@@ -353,6 +353,33 @@ def persistent_memory_answer(user_id, query):
     return user_memory_get(user_id, query)
 
 
+def get_persistent_context(user_id):
+    """Son konuşma kaydını takip sorularında kullanılmak üzere getirir."""
+    if not user_id:
+        return None
+    raw = user_memory_get(user_id, "__last_conversation__")
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def get_last_code_context(user_id):
+    if not user_id:
+        return None
+    raw = user_memory_get(user_id, "__last_code_request__")
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
 def save_code_memory(user_id, query, code_answer):
     if not user_id or not query or not code_answer:
         return
@@ -932,71 +959,138 @@ def github_repo_code_search(query, language="python", num_repos=4):
     except Exception:
         return []
 
-def generate_code_fallback(query, language):
-    subject = code_request_subject(query)
-    safe_subject = re.sub(r"[^a-zA-Z0-9_ -]", "", subject).strip()[:60] or "Vantorium"
+def _code_variation(query, user_id=None):
+    raw = f"{query}|{user_id or ''}|{time.time_ns()}".encode("utf-8", "ignore")
+    return int(hashlib.sha256(raw).hexdigest()[:8], 16)
+
+
+def _enhance_generated_code(code, language, variant):
+    """Yerel üretimi farklılaştırır ve küçük ama gerçek yardımcı özellikler ekler."""
     if language == "html":
-        return f'''<!doctype html>
+        additions = [
+            """<script>
+(() => {
+  const key = 'vantorium-theme';
+  const saved = localStorage.getItem(key);
+  if (saved) document.documentElement.dataset.theme = saved;
+  window.toggleTheme = () => {
+    const next = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light';
+    document.documentElement.dataset.theme = next;
+    localStorage.setItem(key, next);
+  };
+})();
+</script>""",
+            """<script>
+(() => {
+  document.querySelectorAll('a[href^="#"]').forEach(link => {
+    link.addEventListener('click', event => {
+      const target = document.querySelector(link.getAttribute('href'));
+      if (target) { event.preventDefault(); target.scrollIntoView({behavior:'smooth'}); }
+    });
+  });
+})();
+</script>""",
+            """<script>
+window.addEventListener('error', event => console.error('UI hatası:', event.error || event.message));
+window.addEventListener('unhandledrejection', event => console.error('Async hata:', event.reason));
+</script>"""
+        ]
+        add = additions[variant % len(additions)]
+        return code.replace("</body>", add + "\n</body>") if "</body>" in code else code + "\n" + add
+    if language == "javascript":
+        extras = [
+            "\n\n// Ek varyant: kontrollü async çalıştırma\nconst safeRun = async fn => { try { return await fn(); } catch (error) { console.error(error); return null; } };",
+            "\n\n// Ek varyant: debounce\nconst debounce = (fn, wait = 250) => { let timer; return (...args) => { clearTimeout(timer); timer = setTimeout(() => fn(...args), wait); }; };",
+            "\n\n// Ek varyant: istek kimliği\nconst requestId = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;"
+        ]
+        return code + extras[variant % len(extras)]
+    if language == "python":
+        extras = [
+            "\n\n# Ek varyant: logging\nimport logging\nlogging.basicConfig(level=logging.INFO, format='%(levelname)s | %(message)s')\nlogger = logging.getLogger(__name__)",
+            "\n\n# Ek varyant: kontrollü retry\ndef retry(action, attempts=3):\n    last_error = None\n    for _ in range(max(1, attempts)):\n        try:\n            return action()\n        except Exception as exc:\n            last_error = exc\n    raise last_error",
+            "\n\n# Ek varyant: ortam ayarı\nimport os\nAPP_ENV = os.getenv('APP_ENV', 'development')\nDEBUG = APP_ENV.lower() != 'production'"
+        ]
+        return code + extras[variant % len(extras)]
+    return code
+
+
+def generate_code_fallback(query, language, user_id=None):
+    subject = code_request_subject(query)
+    safe_subject = re.sub(r"[^a-zA-Z0-9_ -]", "", subject).strip()[:70] or "Vantorium"
+    variant = _code_variation(query, user_id)
+
+    if language == "html":
+        code = f"""<!doctype html>
 <html lang="tr">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>{html.escape(safe_subject)}</title>
-  <style>
-    *{{box-sizing:border-box}}body{{margin:0;font-family:Inter,Arial,sans-serif;background:#080b10;color:#fff;display:grid;place-items:center;min-height:100vh;padding:24px}}
-    .card{{width:min(720px,100%);padding:32px;border:1px solid #24303d;border-radius:20px;background:#101720;box-shadow:0 25px 80px #0008}}
-    button{{border:0;border-radius:12px;padding:12px 18px;background:#16d39a;color:#03130e;font-weight:800;cursor:pointer}}
-  </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="{html.escape(safe_subject)}">
+<title>{html.escape(safe_subject)}</title>
+<style>
+:root {{ --bg:#070b10; --panel:#101821; --line:#263443; --text:#eef5fb; --muted:#9aa9b8; --accent:#36ddb0; }}
+* {{ box-sizing:border-box; }}
+body {{ margin:0; font-family:Inter,system-ui,sans-serif; background:radial-gradient(circle at 20% 0%,#13252b 0,transparent 42%),var(--bg); color:var(--text); min-height:100vh; }}
+.wrap {{ width:min(980px,calc(100% - 32px)); margin:auto; padding:48px 0; }}
+.card {{ padding:30px; border:1px solid var(--line); border-radius:24px; background:rgba(16,24,33,.88); backdrop-filter:blur(18px); box-shadow:0 30px 100px #0006; }}
+h1 {{ font-size:clamp(30px,6vw,58px); line-height:1.04; margin:0 0 14px; }}
+p {{ color:var(--muted); line-height:1.7; max-width:68ch; }}
+.actions {{ display:flex; gap:10px; flex-wrap:wrap; margin-top:24px; }}
+button {{ border:1px solid var(--line); border-radius:13px; padding:11px 16px; background:#15212d; color:var(--text); cursor:pointer; font-weight:700; }}
+.primary {{ background:var(--accent); color:#03130d; border-color:transparent; }}
+</style>
 </head>
 <body>
-  <main class="card">
-    <h1>{html.escape(safe_subject)}</h1>
-    <p>Vantorium tarafından oluşturulan başlangıç arayüzü.</p>
-    <button onclick="alert('Hazır!')">Başlat</button>
-  </main>
+<main class="wrap"><section class="card">
+<h1>{html.escape(safe_subject)}</h1>
+<p>İsteğine göre oluşturulmuş, mobil uyumlu ve geliştirilebilir başlangıç uygulaması.</p>
+<div class="actions"><button class="primary" onclick="startApp()">Başlat</button><button onclick="showInfo()">Bilgi</button></div>
+<p id="output" aria-live="polite"></p>
+</section></main>
+<script>
+function startApp() {{ document.getElementById('output').textContent = 'Uygulama hazır.'; }}
+function showInfo() {{ document.getElementById('output').textContent = 'Çalışıyor: {html.escape(safe_subject)}'; }}
+</script>
 </body>
-</html>'''
-    if language == "javascript":
-        return f'''// {safe_subject}
+</html>"""
+    elif language == "javascript":
+        code = f"""// {safe_subject}
 const app = {{
   name: {safe_subject!r},
-  start() {{
-    console.log(`${{this.name}} hazır.`);
-  }}
+  started: false,
+  start() {{ this.started = true; console.log(`${{this.name}} hazır.`); return this; }},
+  stop() {{ this.started = false; return this; }}
 }};
-
 app.start();
-'''
-    if language == "php":
-        return f'''<?php
-// {safe_subject}
+"""
+    elif language == "php":
+        code = f"""<?php
 declare(strict_types=1);
 header('Content-Type: application/json; charset=utf-8');
-echo json_encode([
-    'ok' => true,
-    'message' => '{safe_subject}',
-], JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
-'''
-    if language == "sql":
+$payload = ['ok' => true, 'app' => {safe_subject!r}, 'timestamp' => gmdate('c')];
+echo json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
+"""
+    elif language == "sql":
         escaped = safe_subject.replace("'", "''")
-        return f'''-- {safe_subject}
+        code = f"""-- {safe_subject}
 CREATE TABLE IF NOT EXISTS vantorium_items (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+CREATE INDEX IF NOT EXISTS idx_vantorium_items_name ON vantorium_items(name);
 INSERT INTO vantorium_items (name) VALUES ('{escaped}');
-SELECT * FROM vantorium_items ORDER BY id DESC;
-'''
-    if language == "bash":
-        return f'''#!/usr/bin/env bash
+SELECT id, name, created_at FROM vantorium_items ORDER BY id DESC;
+"""
+    elif language == "bash":
+        code = f"""#!/usr/bin/env bash
 set -euo pipefail
-# {safe_subject}
-echo "{safe_subject} hazır."
-'''
-    return f'''#!/usr/bin/env python3
-# {safe_subject} — Vantorium tarafından oluşturulan başlangıç.
-
+APP_NAME={safe_subject!r}
+printf '%s hazır.\\n' "$APP_NAME"
+"""
+    else:
+        code = f"""#!/usr/bin/env python3
+# {safe_subject} - geliştirilebilir başlangıç.
 from __future__ import annotations
 
 
@@ -1006,7 +1100,8 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-'''
+"""
+    return _enhance_generated_code(code, language, variant)
 
 def _format_code_answer(code, language, title="Kod", source="uretilen_kod", user_id=None):
     """Kod 40 KB'dan büyükse dosya olarak saklar ve indirme linki verir."""
@@ -1030,8 +1125,62 @@ def _format_code_answer(code, language, title="Kod", source="uretilen_kod", user
     return (f"**{title}**\n\n```{language}\n{code}\n```", source)
 
 
-def code_response(query, user_id=None):
+def _extract_code_block(text):
+    if not text:
+        return None, None
+    m = re.search(r"```([A-Za-z0-9_+#-]*)\s*\n(.*?)```", str(text), re.S)
+    if not m:
+        return None, None
+    lang = (m.group(1) or "python").lower()
+    aliases = {"py":"python", "js":"javascript", "ts":"javascript", "c#":"csharp"}
+    return aliases.get(lang, lang), m.group(2).strip()
+
+
+def _edit_previous_code(query, previous_answer):
+    lang, code = _extract_code_block(previous_answer)
+    if not code:
+        return None
+    q = normalize(query)
+    wants_color = bool(re.search(r"\b(renk|renkli|renklerini|color|colored|renklendir)\b", q))
+    wants_upgrade = bool(re.search(r"\b(geliştir|güçlendir|sağlamlaştır|iyileştir|modernleştir|düzelt|profesyonel)\b", q))
+    if not (wants_color or wants_upgrade):
+        return None
+
+    edited = code
+    note = []
+    if wants_color and lang == "python":
+        # Harici paket gerektirmeyen ANSI renkleri; basit print çağrılarını güvenli biçimde sar.
+        if "RESET =" not in edited:
+            prefix = 'RESET = "\\033[0m"\nCYAN = "\\033[96m"\nGREEN = "\\033[92m"\n\n'
+            edited = prefix + edited
+        edited = re.sub(r"(?m)^(\s*)print\(([^\n()]*)\)$", r'\1print(CYAN + str(\2) + RESET)', edited)
+        note.append("Terminal çıktıları ANSI renkleriyle zenginleştirildi.")
+    elif wants_color and lang == "html":
+        style = '<style>body{color:#eef5fb;background:#0b1017} h1{color:#36ddb0} p{color:#9aa9b8} .colored{color:#7dd3fc}</style>'
+        edited = style + "\n" + edited
+        note.append("Metinler için renk paleti ve görünüm katmanı eklendi.")
+    elif wants_color and lang == "javascript":
+        edited = "const RESET = '\\x1b[0m';\nconst CYAN = '\\x1b[36m';\n\n" + edited
+        edited = edited + "\nconst colorLog = (...args) => console.log(CYAN, ...args, RESET);\n"
+        note.append("Konsol çıktıları için ANSI renk yardımcıları eklendi; colorLog(...) ile kullanılabilir.")
+    if wants_upgrade:
+        if lang == "python" and "try:" not in edited:
+            edited += '\n\n# Sağlamlık katmanı: ana çalışmayı kontrollü hata yönetimiyle sarabilirsin.\n'
+            note.append("Kodun genişletilmesi için hata yönetimi noktası eklendi.")
+        elif lang == "javascript" and "safeRun" not in edited:
+            edited += '\n\nconst safeRun = async fn => { try { return await fn(); } catch (error) { console.error(error); return null; } };\n'
+            note.append("Async hata yakalama yardımcı fonksiyonu eklendi.")
+
+    title = "Önceki kod güncellendi"
+    explanation = "\n".join("- " + x for x in note) if note else "- Önceki kod bağlamı korunarak güncellendi."
+    return f"## {title}\n\n{explanation}\n\n```{lang}\n{edited}\n```\n"
+
+
+def code_response(query, user_id=None, previous_answer=None):
     language = detect_code_language(query)
+    edited = _edit_previous_code(query, previous_answer)
+    if edited:
+        return (edited, "uretilen_kod")
     if DANGEROUS_CODE_RE.search(query):
         safe = '''# Güvenli savunma örneği: HTTP erişimlerini sınırlama ve şüpheli IP'leri raporlama
 from collections import defaultdict, deque
@@ -1057,14 +1206,15 @@ print("Savunma rate-limit örneği hazır.")
     subject = code_request_subject(query)
     candidates = github_repo_code_search(subject, language)
     if candidates:
-        best = candidates[0]
+        pick = _code_variation(subject, user_id) % min(3, len(candidates))
+        best = candidates[pick]
         title = f"GitHub örneği — {best.get('title', 'repo')}"
         return _format_code_answer(best["code"], language, title=title, source="github_kod", user_id=user_id)
 
-    generated = generate_code_fallback(query, language)
+    generated = generate_code_fallback(query, language, user_id=user_id)
     return _format_code_answer(
         generated, language,
-        title="Başlangıç kodu (yerel üretildi)",
+        title="Gelişmiş kod (yerel üretildi)",
         source="uretilen_kod",
         user_id=user_id
     )
@@ -1185,7 +1335,12 @@ LOCAL_KNOWLEDGE = {
     "internet": "İnternet, dünya genelindeki bilgisayar ağlarını ortak iletişim kurallarıyla birbirine bağlayan küresel ağ sistemidir.",
     "veritabanı": "Veritabanı, bilgilerin düzenli biçimde saklanmasını, aranmasını, güncellenmesini ve yönetilmesini sağlayan sistemdir.",
     "ddos": "DDoS, bir hizmeti çok sayıda kaynaktan gelen yoğun trafikle erişilemez hâle getirmeyi amaçlayan dağıtık hizmet engelleme saldırısıdır. Savunmada trafik filtreleme, hız sınırı, CDN ve sağlayıcı koruması kullanılır.",
-    "makine öğrenmesi": "Makine öğrenmesi, bilgisayarların verilerdeki örüntülerden model oluşturmasını sağlayan yapay zekâ alanıdır."
+    "makine öğrenmesi": "Makine öğrenmesi, bilgisayarların verilerdeki örüntülerden model oluşturmasını sağlayan yapay zekâ alanıdır.",
+    'iyi': 'İyi; olumlu, uygun, yararlı veya istenen nitelikte olan demektir. Bir kişinin durumunu anlatırken de sağlıklı, keyfi yerinde veya memnun anlamında kullanılabilir. Örnek: "Bugün iyiyim."',
+    'kötü': 'Kötü; olumsuz, istenmeyen, zararlı veya beklentinin altında olan demektir. Örnek: "Bugün hava kötü."',
+    'merhaba': 'Merhaba, karşılaşma veya konuşma başlatırken kullanılan bir selamlaşma sözüdür.',
+    'selam': 'Selam, birini karşılamak veya konuşma başlatmak için kullanılan samimi bir selamlaşma sözüdür.',
+    'teşekkür': 'Teşekkür, yapılan bir iyilik veya yardım karşısında duyulan memnuniyeti ifade eden sözdür.'
 }
 
 WORD_SYLLABLES = (
@@ -1266,6 +1421,59 @@ def local_creative_answer(query):
 
     return None
 
+def structured_local_answer(query):
+    """Google/LLM olmadan sık kullanılan istekleri işe yarar cevaplara çevirir."""
+    q = normalize(query)
+
+    # 30 günlük Python başlangıç planı
+    if re.search(r"\b30\s*g[uü]nl[uü]k\b", q) and re.search(r"python", q) and re.search(r"(plan|öğren|ogren|başla|basla)", q):
+        days = [
+            ("Python ve ortam", "Python kurulumu, terminal ve ilk print()", "print(\"Merhaba Python!\")"),
+            ("Değişkenler", "str, int, float, bool ve değişkenler", "ad = \"Polat\"\nprint(ad)"),
+            ("Girdi ve çıktı", "input(), print() ve f-string", "ad = input(\"Adın: \" )\nprint(f\"Merhaba {ad}!\")"),
+            ("Operatörler", "Aritmetik, karşılaştırma ve mantıksal operatörler", "yas = 18\nprint(yas >= 18)"),
+            ("Koşullar", "if / elif / else", "puan = 75\nif puan >= 50:\n    print(\"Geçti\")\nelse:\n    print(\"Kaldı\")"),
+            ("Döngüler", "for ve range", "for i in range(1, 6):\n    print(i)"),
+            ("while", "Koşula bağlı tekrar, break ve continue", "sayac = 0\nwhile sayac < 3:\n    print(sayac)\n    sayac += 1"),
+            ("Listeler", "Liste, indeks, append ve remove", "meyveler = [\"elma\", \"armut\"]\nmeyveler.append(\"muz\")"),
+            ("Tuple ve set", "Tuple ve benzersiz eleman kümeleri", "sayilar = {1, 2, 2, 3}\nprint(sayilar)"),
+            ("Sözlükler", "dict ve anahtar/değer mantığı", "kisi = {\"ad\": \"Polat\", \"yas\": 18}"),
+            ("Fonksiyonlar", "def, parametre ve return", "def topla(a, b):\n    return a + b"),
+            ("Kapsam", "Yerel değişken ve temiz fonksiyon tasarımı", "def selamla(ad):\n    return f\"Merhaba {ad}\""),
+            ("String işlemleri", "split, join, replace, lower, upper, strip", "metin = \" Merhaba \"\nprint(metin.strip().lower())"),
+            ("List comprehension", "Kısa liste üretimi", "kareler = [x*x for x in range(6)]"),
+            ("Hata yönetimi", "try / except", "try:\n    sayi = int(input(\"Sayı: \"))\nexcept ValueError:\n    print(\"Geçerli bir sayı gir.\")"),
+            ("Dosyalar", "Dosya yazma ve okuma", "with open(\"not.txt\", \"w\", encoding=\"utf-8\") as f:\n    f.write(\"Merhaba\")"),
+            ("Modüller", "import ve standart kütüphane", "import random\nprint(random.randint(1, 10))"),
+            ("Paketler", "venv ve pip", "python -m venv .venv\npip install requests"),
+            ("JSON", "JSON okuma/yazma", "import json\ndata = {\"ad\": \"Polat\"}\nprint(json.dumps(data, ensure_ascii=False))"),
+            ("HTTP ve requests", "GET isteği ve status code", "import requests\nr = requests.get(\"https://example.com\", timeout=10)\nprint(r.status_code)"),
+            ("Fonksiyon tasarımı", "Kod tekrarını azaltma", "def temizle(metin):\n    return metin.strip().lower()"),
+            ("OOP giriş", "class, object ve __init__", "class Kullanici:\n    def __init__(self, ad):\n        self.ad = ad"),
+            ("OOP devam", "Miras ve sınıf tasarımı", "class Admin(Kullanici):\n    pass"),
+            ("Debug", "Traceback ve hata ayıklama", "def bol(a, b):\n    return a / b"),
+            ("Test", "assert ve temel test mantığı", "assert 2 + 2 == 4"),
+            ("SQLite", "Tablo, INSERT ve SELECT", "import sqlite3\ncon = sqlite3.connect(\"app.db\")"),
+            ("Flask", "Basit web sunucusu ve route", "from flask import Flask\napp = Flask(__name__)\n\n@app.get(\"/\")\ndef home():\n    return \"Merhaba\""),
+            ("API projesi", "JSON dönen Flask endpoint'i", "@app.get(\"/api/merhaba\")\ndef api():\n    return {\"mesaj\": \"Merhaba\"}"),
+            ("Mini proje", "Görev listesi veya not uygulaması", "gorevler = []\ngorevler.append(\"Python çalış\")"),
+            ("Final", "Projeyi temizle, test et ve README yaz", "print(\"Proje tamamlandı!\")"),
+        ]
+        out = ["# 30 Günlük Python Öğrenme Planı", "", "Her gün 45–90 dakika ayır. Konuyu öğrendikten sonra kodu değiştirerek en az 2 küçük deneme yap.", ""]
+        for i, (title, topic, code) in enumerate(days, 1):
+            out += [f"## Gün {i} — {title}", f"**Öğren:** {topic}", "**Mini görev:** Konuyu kullanarak küçük bir örnek yaz.", f"```python\n{code}\n```", ""]
+        out += ["## 30 günün sonunda", "Kendi başına küçük bir Python projesi yazabilecek seviyeye gelmiş olmalısın. Sonraki adım olarak Flask + SQLite ile gerçek bir web uygulamasına geçebilirsin."]
+        return "\n".join(out), "yerel_plan"
+
+    m = DEFINITION_RE.match(query or "")
+    if m:
+        target = normalize(m.group(1)).strip()
+        direct = LOCAL_KNOWLEDGE.get(target)
+        if direct:
+            return f"**{m.group(1).strip()}** ne demek?\n\n{direct}", "yerel_sozluk"
+    return None
+
+
 def local_knowledge_answer(query):
     q = normalize(query)
     if len(q.split()) > 4:  # uzun/ayrıntılı sorularda tanım dönme
@@ -1302,11 +1510,10 @@ def universal_fallback_answer(query):
 
     if re.search(r"\b(nedir|ne demek|anlamı|kimdir|hakkında|bilgi)\b", nq):
         return (
-            f"**{q}** için şu anda güvenilir bir Google sonucu alınamadı. Yine de soruyu boş bırakmıyorum: "
-            f"soru **{topic}** konusunu soruyor.\n\n"
-            "Bir kavramı açıklarken temel anlamı, ne işe yaradığı, nerede kullanıldığı ve kısa bir örnek "
-            "üzerinden ilerlemek en doğru yaklaşımdır. Elimde doğrulanmış kaynak metni olmadığından burada "
-            "uydurma bir tanım vermek yerine kesinliği düşük bilgiyi açıkça ayırıyorum."
+            f"**{q}** hakkında temel açıklama\n\n"
+            f"Bu soru **{topic}** konusunu soruyor. Google sonucu alınamadığında bile cevabı boş bırakmıyorum. "
+            "Konu bir kavramsa temel anlamı, amacı ve günlük kullanımını açıklarım; kişi veya güncel olay "
+            "gibi doğrulama gerektiren konularda isim/tarih uydurmam."
         )
 
     if re.search(r"\b(neden|sebebi|sebep|niye)\b", nq):
@@ -1324,12 +1531,10 @@ def universal_fallback_answer(query):
         )
 
     return (
-        f"**{q}** hakkında bir cevap oluşturuyorum.\n\n"
-        f"Sorunun ana konusu: **{topic}**. Bu isteği boş veya sadece 'bulunamadı' şeklinde bırakmıyorum. "
-        "Vantorium önce yerel bilgi ve hafızayı, ardından Google'ın ilk sonucunu kullanır. Google erişimi başarısız "
-        "olduğunda ise harici bir yapay zekâ çağırmadan yerel cevap motoru devreye girer.\n\n"
-        "Not: Kaynak metni olmadan kesin bir olguyu uydurmamak için doğrulanmamış ayrıntıları gerçekmiş gibi "
-        "sunmuyorum. Yeni bir kaynak geldiğinde cevap otomatik olarak daha ayrıntılı hâle getirilebilir."
+        f"**{q}** için başlangıç cevabı\n\n"
+        f"Ana konu: **{topic}**. Bu isteği boş bırakmıyorum. Önce sorunun ne istediğini belirleyip "
+        "uygulanabilir bir açıklama, örnek veya sonraki adımı veriyorum.\n\n"
+        "Güncel veya doğrulama gerektiren bir konuysa doğrulanmış kaynak olmadan ayrıntı uydurmam."
     )
 
 def local_fallback_answer(query):
@@ -1397,6 +1602,10 @@ def get_answer(query):
         return "Bir şeyler yaz, birlikte bakalım.", "sistem"
 
     parts = analyze_query(query)
+
+    structured = structured_local_answer(query)
+    if structured:
+        return structured
 
     if parts["is_greeting"] or parts.get("is_smalltalk"):
         return smalltalk_answer(query), "sohbet"
@@ -3402,8 +3611,9 @@ def match_template(query, parts):
     return None
 
 
-def template_answer(tpl):
-    out = [f"## {tpl['title']}", "", tpl["desc"], "", f"```{tpl['lang']}", tpl["code"].strip("\n"), "```", "",
+def template_answer(tpl, query="", user_id=None):
+    code = _enhance_generated_code(tpl["code"].strip("\n"), tpl["lang"], _code_variation(query or tpl["title"], user_id))
+    out = [f"## {tpl['title']}", "", tpl["desc"], "", f"```{tpl['lang']}", code, "```", "",
            "## Kurulum ve çalıştırma", ""]
     out += [f"{i}. {s}" for i, s in enumerate(tpl["setup"], 1)]
     out += ["", "## Geliştirme fikirleri", ""] + [f"- {s}" for s in tpl["ideas"]]
@@ -3455,17 +3665,44 @@ def _remember_and_stream(text, source, uid, query):
     text = text or ""
     if uid and text:
         remember_conversation(uid, query, text, source)
-        if source in {"github_kod", "uretilen_kod", "kod_sablon", "github_kod_dosya", "uretilen_kod_dosya"}:
+        if source in {"github_kod", "uretilen_kod", "kod_sablon", "github_kod_dosya", "uretilen_kod_dosya", "guvenli_kod"}:
             save_code_memory(uid, query, text)
     yield from _stream_text(text, source)
+    if source in {"github_kod", "uretilen_kod", "kod_sablon", "github_kod_dosya", "uretilen_kod_dosya", "guvenli_kod"}:
+        yield "followup", {"text": "Başka bir şey eklememi ister misin? İstersen bu kodu daha gelişmiş, hızlı, güvenli veya farklı bir tasarıma dönüştürebilirim."}
+
+
+def _history_context(query, history, uid=None):
+    q = str(query or '').strip()
+    recent = _clean_history(history, 24)
+    previous_user = next((m["content"] for m in reversed(recent[:-1]) if m["role"] == "user"), "")
+    previous_ai = next((m["content"] for m in reversed(recent) if m["role"] == "assistant"), "")
+    persistent = get_persistent_context(uid) if uid else None
+    if not previous_user and persistent:
+        previous_user = str(persistent.get("question", ""))
+    if not previous_ai and persistent:
+        previous_ai = str(persistent.get("answer", ""))
+    follow = bool(re.search(r"\b(bunu|şunu|bunun|önceki|yukarıdaki|az önce|devam|geliştir|değiştir|düzelt|aynısını|aynı kod|buna|buradaki|üstteki)\b", normalize(q)))
+    return q, previous_user[:6000], previous_ai[:9000], follow
+
+
+def _code_context_query(query, previous_user, previous_ai):
+    parts = [query.strip()]
+    if previous_user:
+        parts.append("ÖNCEKİ KULLANICI İSTEĞİ:\n" + previous_user)
+    if previous_ai:
+        parts.append("ÖNCEKİ VANTORIUM CEVABI:\n" + previous_ai[:7000])
+    return "\n\n".join(parts)
 
 
 def answer_events(query, history, uid=None):
     """(olay, veri) çiftleri üretir: status, sources, delta, done."""
     G = _G
-    parts = G["analyze_query"](query)
     q_norm = G["normalize"](query)
     dataset = G.get("DATASET", {})
+    current_query, previous_user, previous_ai, is_followup = _history_context(query, history, uid)
+    effective_query = _code_context_query(current_query, previous_user, previous_ai) if is_followup else current_query
+    parts = G["analyze_query"](effective_query)
 
     # 0) Kalıcı hafıza: kullanıcı yeni bir bilgi veriyorsa öğren, ardından hatırla.
     if uid:
@@ -3479,33 +3716,38 @@ def answer_events(query, history, uid=None):
             yield from _remember_and_stream(remembered, "kalici_hafiza", uid, query)
             return
 
-    # 1) Hızlı yerel yollar: selam, sohbet, matematik, riskli istekler, veri seti
+    # 1) Hızlı yerel yollar: özel planlar, tanımlar, selam, sohbet, matematik...
+    structured = G.get("structured_local_answer")(current_query)
+    if structured:
+        yield from _remember_and_stream(structured[0], structured[1], uid, query)
+        return
+
     if (parts.get("is_greeting") or parts.get("is_smalltalk") or parts.get("is_math")
             or G["DANGEROUS_CODE_RE"].search(query) or (q_norm in dataset and dataset[q_norm])):
-        answer, source = G["get_answer"](query)
+        answer, source = G["get_answer"](current_query)
         yield from _remember_and_stream(answer, source, uid, query)
         return
 
     # 2) Hazır, çalışan kod şablonları
-    tpl = match_template(query, parts)
+    tpl = match_template(effective_query, parts)
     if tpl:
         yield "status", {"text": "Kodu hazırlıyor…"}
-        yield from _remember_and_stream(template_answer(tpl), "kod_sablon", uid, query)
+        yield from _remember_and_stream(template_answer(tpl, effective_query, uid), "kod_sablon", uid, query)
         return
 
     # 3) Yaratıcı üretim, öneri, şablonu olmayan kod istekleri
-    local = G["local_creative_answer"](query)
+    local = G["local_creative_answer"](current_query)
     if not local and parts.get("is_recommendation"):
-        local = G["recommendation_answer"](query)
+        local = G["recommendation_answer"](current_query)
     if not local and parts.get("is_code_request"):
         yield "status", {"text": "GitHub'da uygun kod arıyor…"}
-        local = G["code_response"](query, user_id=uid)
+        local = G["code_response"](effective_query, user_id=uid, previous_answer=previous_ai)
     if local:
         yield from _remember_and_stream(local[0], local[1], uid, query)
         return
 
     # 4) Araştırma: Google ilk sonucu → yerel, kaynaklı cevap
-    topic_query, depth = _contextualize(query, history)
+    topic_query, depth = _contextualize(current_query, history)
     topic_parts = G["analyze_query"](topic_query)
     result = None
     try:
@@ -3750,6 +3992,7 @@ html,body{height:100%;overflow:hidden}
 .vx-src b{display:grid;place-items:center;width:19px;height:19px;flex:0 0 19px;border-radius:6px;background:rgba(45,212,167,.14);color:var(--accent);font-size:11px}
 .vx-src span{min-width:0;max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .vx-src em{font-style:normal;color:var(--muted)}
+.vx-followup{margin-top:16px;padding:12px 14px;border:1px solid rgba(54,221,176,.18);border-radius:14px;background:linear-gradient(135deg,rgba(54,221,176,.07),rgba(54,221,176,.02));color:#b9c8d5;font:500 13px/1.55 Inter,system-ui,sans-serif}.vx-followup::before{content:"✦ ";color:var(--accent)}
 .vx-actions{display:flex;gap:4px;margin-top:12px}
 .vx-actions button{display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border-radius:8px;color:var(--muted);font-size:12.5px}
 .vx-actions button:hover{background:var(--ink3);color:#fff}
@@ -3832,7 +4075,7 @@ html,body{height:100%;overflow:hidden}
         <textarea id="input" rows="1" placeholder="Vantorium'a sor veya kod iste…" aria-label="Mesajın"></textarea>
         <button class="vx-send" id="sendBtn" type="submit" aria-label="Gönder"></button>
       </form>
-      <div class="vx-hint">Vantorium hata yapabilir. Önemli bilgileri doğrula.</div>
+      <div class="vx-hint">Vantorium • Bağlamı hatırlar • Kodları geliştirir • Kaynak gerektiğinde Google'ı kullanır</div>
     </div>
   </section>
 </div>
@@ -3845,7 +4088,7 @@ html,body{height:100%;overflow:hidden}
   const $ = id => document.getElementById(id);
   const shell = $('shell'), thread = $('thread'), scroller = $('scroll'), input = $('input');
   const form = $('composer'), sendBtn = $('sendBtn'), jump = $('jump'), listEl = $('convList'), titleEl = $('chatTitle');
-  const STORE = 'vantorium.convs.v2:' + USER;
+  const STORE = 'vantorium.convs.v3:' + USER;
   const coarse = window.matchMedia('(pointer:coarse)').matches;
   let convs = [], active = null, controller = null, streaming = false, stick = true, raf = 0;
 
@@ -3955,6 +4198,7 @@ html,body{height:100%;overflow:hidden}
     if (m.content) h += '<div class="vx-prose">' + md(m.content, m.sources, m.pending) + '</div>';
     if (m.error) h += '<div class="vx-error">' + esc(m.error) + '</div>';
     if (m.sources && m.sources.length) h += sourcesHTML(m.sources);
+    if (!m.pending && m.followup) h += '<div class="vx-followup">' + esc(m.followup) + '</div>';
     if (!m.pending) {
       h += '<div class="vx-actions">' + (m.content ? '<button type="button" data-act="copy-msg">' + ICON.copy + ' Kopyala</button>' : '') +
         (isLast ? '<button type="button" data-act="regen">' + ICON.redo + ' Yeniden üret</button>' : '') + '</div>';
@@ -4029,7 +4273,7 @@ html,body{height:100%;overflow:hidden}
     text = (text || '').trim();
     if (!text || streaming) return;
     const c = cur() || newConv();
-    const history = c.messages.filter(m => m.content && !m.error).slice(-12)
+    const history = c.messages.filter(m => m.content && !m.error).slice(-24)
       .map(m => ({role: m.role === 'ai' ? 'assistant' : 'user', content: m.content.slice(0, 4000)}));
     c.messages.push({role: 'user', content: text});
     const ai = {role: 'ai', content: '', pending: true, status: 'Düşünüyor…', sources: []};
@@ -4064,6 +4308,7 @@ html,body{height:100%;overflow:hidden}
       if (ev === 'status') ai.status = p.text;
       else if (ev === 'sources') ai.sources = p.items || [];
       else if (ev === 'delta') ai.content += p.text;
+      else if (ev === 'followup') ai.followup = p.text;
       else if (ev === 'error') ai.error = p.message;
       paint();
     };
