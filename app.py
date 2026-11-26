@@ -622,8 +622,50 @@ def safe_math(expression):
 # GOOGLE CSE SEARCH
 # =========================================================
 
+def _google_public_search(query, num=6):
+    """Google CSE erişilemezse normal Google sonuç sayfasından güvenli bir yedek arama yapar.
+    Harici LLM kullanmaz; yalnızca Google HTML sonuçlarını okur.
+    """
+    try:
+        url = "https://www.google.com/search"
+        r = requests.get(url, params={"q": query, "num": min(max(num, 1), 10), "hl": "tr", "safe": "active"},
+                         headers={"User-Agent": "Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 Chrome/131 Mobile Safari/537.36",
+                                  "Accept-Language": "tr-TR,tr;q=0.9,en;q=0.5"}, timeout=8)
+        if r.status_code != 200:
+            return []
+        text = r.text
+        results=[]
+        seen=set()
+        for m in re.finditer(r'<a href="/url\?q=([^&]+)[^>]*>(.*?)</a>', text, re.I|re.S):
+            href=urllib.parse.unquote(m.group(1))
+            if not href.startswith(('http://','https://')) or 'google.' in urllib.parse.urlparse(href).netloc:
+                continue
+            title=_strip_tags(m.group(2)) if '_strip_tags' in globals() else re.sub(r'<[^>]+>',' ',m.group(2))
+            title=html.unescape(re.sub(r'\s+',' ',title)).strip()
+            if not title or href in seen or 'wikipedia.org' in urllib.parse.urlparse(href).netloc.lower():
+                continue
+            seen.add(href)
+            results.append({"title":title[:180],"url":href,"snippet":"","source":"Google"})
+            if len(results)>=num: break
+        if results:
+            return results
+        # Yeni Google HTML biçimi: doğrudan href bağlantıları.
+        for m in re.finditer(r'<a href="(https?://[^"#]+)"[^>]*>(.*?)</a>', text, re.I|re.S):
+            href=html.unescape(m.group(1))
+            host=urllib.parse.urlparse(href).netloc.lower()
+            if not href.startswith(('http://','https://')) or 'google.' in host or 'wikipedia.org' in host:
+                continue
+            title=html.unescape(re.sub(r'\s+',' ',re.sub(r'<[^>]+>',' ',m.group(2)))).strip()
+            if len(title)<3 or href in seen: continue
+            seen.add(href); results.append({"title":title[:180],"url":href,"snippet":"","source":"Google"})
+            if len(results)>=num: break
+        return results
+    except Exception as e:
+        print(f"[google-public] hata: {e}")
+        return []
+
 def cse_search(query, search_type="web", num=6):
-    """Google'da arar; sonuçları {title, url, snippet, source} listesi olarak döner."""
+    """Google'da arar; CSE -> Google public HTML fallback. Harici AI yoktur."""
 
     api_key = os.environ.get("GOOGLE_API_KEY", "").strip()
     if api_key:
@@ -672,39 +714,36 @@ def cse_search(query, search_type="web", num=6):
 
         if r.status_code != 200:
             print(f"[google] HTTP {r.status_code}")
-            return []
+        else:
+            match = re.search(r"vantoriumCallback\((.*)\)\s*;?\s*$", r.text, re.S)
+            if match:
+                data = json.loads(match.group(1))
+                raw_results = data.get("results", [])
+                results = []
+                for item in raw_results:
+                    link = item.get("unescapedUrl") or item.get("url") or ""
+                    title = item.get("titleNoFormatting") or item.get("title") or ""
+                    snippet = item.get("contentNoFormatting") or item.get("content") or ""
+                    if not link:
+                        continue
+                    results.append({
+                        "title": html.unescape(title).strip(),
+                        "url": link,
+                        "snippet": re.sub(r"\s+", " ", html.unescape(snippet)).strip(),
+                        "source": "Google"
+                    })
+                if results:
+                    return results
+            else:
+                print("[google] beklenmeyen yanıt biçimi")
 
-        match = re.search(r"vantoriumCallback\((.*)\)\s*;?\s*$", r.text, re.S)
-
-        if not match:
-            print("[google] beklenmeyen yanıt biçimi")
-            return []
-
-        data = json.loads(match.group(1))
-        raw_results = data.get("results", [])
-
-        results = []
-
-        for item in raw_results:
-            link = item.get("unescapedUrl") or item.get("url") or ""
-            title = item.get("titleNoFormatting") or item.get("title") or ""
-            snippet = item.get("contentNoFormatting") or item.get("content") or ""
-
-            if not link:
-                continue
-
-            results.append({
-                "title": html.unescape(title).strip(),
-                "url": link,
-                "snippet": re.sub(r"\s+", " ", html.unescape(snippet)).strip(),
-                "source": "Google"
-            })
-
-        return results
+        return _google_public_search(query, num)
 
     except Exception as e:
         print(f"[google] hata: {e}")
-        return []
+
+    # CSE/proxy başarısızsa doğrudan Google arama sayfasına düş.
+    return _google_public_search(query, num)
 
 # =========================================================
 # GOOGLE IMAGE SEARCH
@@ -1450,9 +1489,14 @@ def search_everywhere(query, parts=None):
     if parts is None:
         parts = analyze_query(query)
     search_query = make_search_query(query, parts)
-    google_results = cse_search(search_query, "web", 6)
+    google_results = cse_search(search_query, "web", 8)
+    # Google sonuçları yoksa ikinci, daha sade bir sorgu dene.
+    if not google_results:
+        simple = re.sub(r"\s+", " ", extract_target(query, parts)).strip()[:180]
+        if simple and simple != search_query:
+            google_results = cse_search(simple + " -site:wikipedia.org -site:tr.wikipedia.org", "web", 8)
     github_results = github_search(search_query, 5) if parts.get("is_code") else []
-    results = best_results(google_results + github_results, search_query, 8)
+    results = best_results(google_results + github_results, search_query, 10)
     query_terms = [w for w in normalize(search_query).split() if len(w) >= 3]
     relevant = []
     for item in results:
@@ -1885,6 +1929,64 @@ def enhanced_local_reasoning(query):
 
     return None
 
+def _research_intent(query, parts):
+    q = normalize(query or "")
+    # Güncel/doğrulanabilir bilgi isteyen sorular: kişi, şirket, ürün, olay, haber, fiyat, sürüm, tarih.
+    return bool(
+        parts.get("is_definition") or
+        re.search(r"\b(kimdir|nedir|ne demek|hakkında|haber|son durum|güncel|bugün|şimdi|fiyat|ücret|sürüm|versiyon|çıktı mı|ne zaman|nerede|kaç|kaç yaş|kurucusu|ceo|başkan|oyuncu|film|dizi|şarkı|oyun|şirket|uygulama|ürün)\b", q) or
+        re.search(r"\b(who|what|latest|news|current|today|price|version|when|where|company|product|movie|game)\b", q)
+    )
+
+def _research_answer(query, parts):
+    """Google sonuçlarından LLM olmadan çok kaynaklı cevap üretir.
+    İlk 3-5 sonucu toplar, sayfaları kısa metin olarak okuyup tekrarları temizler.
+    """
+    try:
+        results = search_everywhere(query, parts)
+        if not results:
+            return None
+        target = extract_target(query, parts)
+        rows=[]; seen=set()
+        for item in results[:6]:
+            url=item.get("url",""); title=clean_snippet(item.get("title",""),180); snippet=clean_snippet(item.get("snippet",""),420)
+            if not url or url in seen: continue
+            seen.add(url)
+            page = fetch_page(url)
+            paras = (page or {}).get("paras", []) if isinstance(page, dict) else []
+            evidence=[]
+            if snippet: evidence.append(snippet)
+            for para in paras[:8]:
+                para=clean_snippet(para,360)
+                if para and normalize(para) not in {normalize(x) for x in evidence}: evidence.append(para)
+                if len(evidence)>=3: break
+            if evidence: rows.append((title,url,evidence))
+            if len(rows)>=4: break
+        if not rows: return None
+        lang=detect_response_language(query)
+        if lang=="en":
+            out=[f"## {target}", "", "I checked Google and compared the most relevant accessible results.", ""]
+            for title,url,evidence in rows[:4]:
+                out.append(f"**{title or 'Source'}**")
+                out.append(evidence[0])
+                if len(evidence)>1: out.append(evidence[1])
+                out.append("")
+            out.append("### Sources")
+            out.extend(f"- [{t or u}]({u})" for t,u,_ in rows[:4])
+            return "\n".join(out), "google_arastirma"
+        out=[f"## {target}", "", "Google'da araştırdım ve erişilebilen ilgili sonuçları karşılaştırdım.", ""]
+        for title,url,evidence in rows[:4]:
+            out.append(f"**{title or 'Kaynak'}**")
+            out.append(evidence[0])
+            if len(evidence)>1: out.append(evidence[1])
+            out.append("")
+        out.append("### Kaynaklar")
+        out.extend(f"- [{t or u}]({u})" for t,u,_ in rows[:4])
+        return "\n".join(out), "google_arastirma"
+    except Exception:
+        log.exception("research engine error")
+        return None
+
 def get_answer(query, user_id=None):
     query = (query or "").strip()
     if not query:
@@ -1896,6 +1998,13 @@ def get_answer(query, user_id=None):
     contextual = contextual_reasoning_answer(query, user_id=user_id)
     if contextual:
         return contextual
+
+    # Güncel/doğrulanabilir sorularda önce Google araştırması yap;
+    # böylece yerel genel cevaplar gerçek web bilgisinin önüne geçmez.
+    if _research_intent(query, parts):
+        researched = _research_answer(query, parts)
+        if researched:
+            return researched
 
     smart = smart_local_reasoning(query)
     if smart:
@@ -1953,7 +2062,11 @@ def get_answer(query, user_id=None):
     if len(query.split()) <= 2 and not parts.get("is_definition"):
         return smalltalk_answer(query), "sohbet"
 
-    results = search_everywhere(query, parts)
+    try:
+        results = search_everywhere(query, parts)
+    except Exception:
+        log.exception("search pipeline error")
+        results = []
     answer = synthesize_answer(query, results, parts)
     if answer:
         memory_save(normalized, answer, 0.72, "web_sentez")
@@ -4260,15 +4373,41 @@ def chat_view():
     return _G["render_page"]("Sohbet", page, user, show_nav=False)
 
 
+_USER_RATE_BUCKETS = defaultdict(deque)
+_USER_RATE_LIMIT = 40
+_USER_RATE_WINDOW = 60
+
+def user_rate_limit(limit=_USER_RATE_LIMIT, window=_USER_RATE_WINDOW):
+    """Giriş yapmış kullanıcıyı IP yerine kullanıcı hesabına göre sınırlar."""
+    def decorator(func):
+        @wraps(func)
+        def wrapped(*args, **kwargs):
+            user = get_current_user()
+            if not user:
+                return jsonify({"error":"Oturum gerekli."}), 401
+            key = str(user["id"])
+            now=time.time()
+            with _RATE_LOCK:
+                bucket=_USER_RATE_BUCKETS[key]
+                while bucket and now-bucket[0] > window: bucket.popleft()
+                if len(bucket)>=limit:
+                    retry=max(1,int(window-(now-bucket[0])))
+                    resp=jsonify({"error":"Çok fazla istek. Biraz bekleyip tekrar dene.","retry_after":retry})
+                    resp.status_code=429; resp.headers["Retry-After"]=str(retry); return resp
+                bucket.append(now)
+            return func(*args, **kwargs)
+        return wrapped
+    return decorator
+
 def register_ai(app, ns):
     """app.py'de: register_ai(app, globals())"""
     global _G
     _G = ns
-    rate_limit, login_required = ns["rate_limit"], ns["login_required"]
+    login_required = ns["login_required"]
     routes = [
         ("/chat", "chat", login_required(chat_view), ["GET"]),
-        ("/api/chat", "api_chat", rate_limit(12, 60)(login_required(api_chat_view)), ["POST"]),
-        ("/api/chat/stream", "api_chat_stream", rate_limit(15, 60)(login_required(chat_stream_view)), ["POST"]),
+        ("/api/chat", "api_chat", user_rate_limit(40, 60)(login_required(api_chat_view)), ["POST"]),
+        ("/api/chat/stream", "api_chat_stream", user_rate_limit(40, 60)(login_required(chat_stream_view)), ["POST"]),
     ]
     for rule, endpoint, view, methods in routes:
         if endpoint in app.view_functions:
